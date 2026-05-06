@@ -2888,7 +2888,7 @@ Aliases:
 !config
 !config path
 !config reload
-!config save
+!config save (IMPORTANT: USE THIS TO SAVE YOUR BOT CONFIG)
 !config enable <casino>
 !config disable <casino>
 !config interval <casino> <minutes>
