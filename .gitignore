@@ -15,5 +15,5 @@ chrome-profile/
 
 
 # Live bot config, generated/edited by the bot
-config/*
-!config/.gitkeep
+# config/*
+# !config/.gitkeep
