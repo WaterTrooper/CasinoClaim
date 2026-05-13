@@ -1,13 +1,18 @@
 # Drake Hooks + WaterTrooper
 # Casino Claim 3
 # Fortune Wheelz API
-# Version 3.4
+# Version 3.5
 # Updated 2026.05.12
 #
 # Notes:
-# - Based on WT's latest working claim flow.
-# - Adds countdown detection when daily bonus is unavailable.
-# - Keeps screenshots for claim, countdown/unavailable, and login timeout.
+# - Keeps the working Fortune Wheelz claim flow.
+# - Fixes false-positive claims when the promo card says "Next in HH:MM:SS".
+# - Reads countdown before trying to click the daily reward card.
+# - Uses the new countdown XPath fallback:
+#   /html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[4]/div/div[1]/div[2]/button
+# - Keeps backwards compatibility with main.py by exposing both:
+#   fortunewheelz_casino()
+#   fortunewheelz_flow()
 
 import re
 import os
@@ -39,38 +44,65 @@ EMAIL_INPUT_XPATH = "//input[@data-tid='login-email-input']"
 PASSWORD_INPUT_XPATH = "//input[@data-tid='login-password-input']"
 LOGIN_SUBMIT_XPATH = "//button[@data-tid='login-btn']"
 
+# Daily reward promo-card button.
+# Important: this same selector can be either available OR "Next in HH:MM:SS".
 CLAIM_REWARD_XPATH = "//button[@data-tid='promo-daily-login-button']"
+
+# Final claim button inside the daily reward modal.
 CLAIM_BUTTON_XPATH = "//button[@data-tid='daily-login-btn']"
 
-# Countdown fallbacks
+# Exact daily reward countdown buttons.
+# New one from your screenshot is first.
+DAILY_CARD_COUNTDOWN_XPATHS = [
+    "/html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[4]/div/div[1]/div[2]/button",
+    "/html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[3]/div/div[1]/div[2]/button",
+]
+
+# Modal countdown fallbacks after opening the reward card.
+MODAL_COUNTDOWN_XPATHS = [
+    "/html/body/div[3]/div/div[2]/div[3]/p",
+    "/html/body/div[4]/div/div[2]/div[3]/p",
+    "/html/body/div[5]/div/div[2]/div[3]/p",
+    "/html/body/div[6]/div/div[2]/div[3]/p",
+    "/html/body/div[7]/div/div[2]/div[3]/p",
+    "/html/body/div[8]/div/div[2]/div[3]/p",
+    "/html/body/div[9]/div/div[2]/div[3]/p",
+]
+
+# Generic but still scoped to the daily login promo button.
 COUNTDOWN_LOCATORS = [
-    # Modal countdown text from older working countdown version
-    (By.XPATH, "/html/body/div[4]/div/div[2]/div[3]/p"),
-    (By.XPATH, "/html/body/div[3]/div/div[2]/div[3]/p"),
-    (By.XPATH, "/html/body/div[5]/div/div[2]/div[3]/p"),
-    (By.XPATH, "/html/body/div[8]/div/div[2]/div[3]/p"),
-    (By.XPATH, "/html/body/div[9]/div/div[2]/div[3]/p"),
+    # Your exact daily card paths.
+    *[(By.XPATH, xp) for xp in DAILY_CARD_COUNTDOWN_XPATHS],
 
-    # Disabled store/promo button absolute fallback from older version
+    # Any Daily Reward promo button saying Next in / containing HH:MM:SS.
     (
         By.XPATH,
-        "/html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[3]/div/div[1]/div[2]/button"
+        "//button[@data-tid='promo-daily-login-button' "
+        "and (contains(normalize-space(.), 'Next in') or contains(normalize-space(.), ':'))]"
     ),
 
-    # Generic disabled button with HH:MM:SS text
+    # CSS class says disabled and text has countdown.
     (
         By.XPATH,
-        "//button[@disabled and contains(normalize-space(.), ':')]"
+        "//button[@data-tid='promo-daily-login-button' "
+        "and contains(@class, 'disabled') "
+        "and contains(normalize-space(.), ':')]"
     ),
 
-    # Generic element containing HH:MM:SS text
+    # Modal paragraph fallback.
+    *[(By.XPATH, xp) for xp in MODAL_COUNTDOWN_XPATHS],
+
+    # Final fallback: any disabled-ish button that says Next in.
     (
         By.XPATH,
-        "//*[contains(normalize-space(.), ':')]"
+        "//button[contains(@class, 'disabled') "
+        "and contains(normalize-space(.), 'Next in') "
+        "and contains(normalize-space(.), ':')]"
     ),
 ]
 
 POPUP_CLOSE_XPATHS = [
+    "/html/body/div[3]/div/div[1]/span",
     "/html/body/div[4]/div/div[1]/span",
     "/html/body/div[5]/div/div[1]/span",
     "/html/body/div[6]/div/div[1]/span",
@@ -117,6 +149,7 @@ def _safe_click(driver, element, label="element") -> bool:
             "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
             element
         )
+        asyncio.sleep(0)
     except Exception:
         pass
 
@@ -139,10 +172,10 @@ def _safe_click(driver, element, label="element") -> bool:
 
 def _normalize_countdown(text: str) -> str | None:
     """
-    Accepts strings like:
-      - 22 : 27 : 06
-      - 22:27:06
-      - Come back in 22:27:06
+    Accepts:
+      - Next in 02:45:59
+      - 02:45:59
+      - 2 : 45 : 59
 
     Returns:
       - HH:MM:SS
@@ -160,13 +193,67 @@ def _normalize_countdown(text: str) -> str | None:
     return f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
 
 
+def _element_text(driver, element) -> str:
+    """
+    Selenium .text sometimes misses Vue button text.
+    This falls back to JS innerText/textContent.
+    """
+    texts = []
+
+    try:
+        texts.append(element.text or "")
+    except Exception:
+        pass
+
+    try:
+        texts.append(driver.execute_script("return arguments[0].innerText || '';", element) or "")
+    except Exception:
+        pass
+
+    try:
+        texts.append(driver.execute_script("return arguments[0].textContent || '';", element) or "")
+    except Exception:
+        pass
+
+    return " ".join(t.strip() for t in texts if t and t.strip()).strip()
+
+
+def _button_looks_disabled(driver, element) -> bool:
+    """
+    Fortune Wheelz uses CSS class 'disabled' instead of always using real disabled attr.
+    Selenium may still think the button is clickable, so check manually.
+    """
+    try:
+        classes = (element.get_attribute("class") or "").lower()
+        if "disabled" in classes:
+            return True
+    except Exception:
+        pass
+
+    for attr in ("disabled", "aria-disabled"):
+        try:
+            value = (element.get_attribute(attr) or "").strip().lower()
+            if value in {"true", "disabled", "1"}:
+                return True
+        except Exception:
+            pass
+
+    text = _element_text(driver, element).lower()
+
+    if "next in" in text:
+        return True
+
+    if _normalize_countdown(text):
+        return True
+
+    return False
+
+
 def _read_countdown(driver) -> str | None:
     """
-    Attempts to find countdown from:
-      1. Daily login modal paragraph
-      2. Disabled promo/store button
-      3. Generic disabled button containing HH:MM:SS
-      4. Generic visible page element containing HH:MM:SS
+    Reads countdown from the daily reward card first, then modal fallbacks.
+    Avoids generic page-wide countdowns so it does not accidentally grab
+    tournament or promo timers.
     """
     for by, value in COUNTDOWN_LOCATORS:
         try:
@@ -174,11 +261,11 @@ def _read_countdown(driver) -> str | None:
 
             for element in elements:
                 try:
-                    text = (element.text or "").strip()
+                    text = _element_text(driver, element)
                     countdown = _normalize_countdown(text)
 
                     if countdown:
-                        print(f"[Fortune Wheelz] Countdown found: {countdown}")
+                        print(f"[Fortune Wheelz] Countdown found: {countdown} from text: {text!r}")
                         return countdown
 
                 except Exception:
@@ -188,6 +275,32 @@ def _read_countdown(driver) -> str | None:
             continue
 
     return None
+
+
+def _find_daily_reward_button(driver):
+    """
+    Finds the Fortune Wheelz daily login promo button.
+    This can be either:
+      - Available claim button
+      - Disabled-looking countdown button: Next in HH:MM:SS
+    """
+    try:
+        buttons = driver.find_elements(By.XPATH, CLAIM_REWARD_XPATH)
+    except Exception:
+        return None
+
+    if not buttons:
+        return None
+
+    # Prefer the first visible daily reward promo button.
+    for btn in buttons:
+        try:
+            if btn.is_displayed():
+                return btn
+        except Exception:
+            continue
+
+    return buttons[0]
 
 
 def _close_popups(driver, max_passes=2):
@@ -219,7 +332,6 @@ def _close_popups(driver, max_passes=2):
                 if try_click(close_btn):
                     print(f"[Fortune Wheelz] Closed popup with XPath: {xp}")
                     closed_any = True
-                    asyncio.sleep(1)
 
             except Exception:
                 pass
@@ -331,7 +443,6 @@ async def fortunewheelz_casino(ctx, driver, channel):
         except Exception as e:
             print(f"[Fortune Wheelz] Login button failed: {e}")
 
-            # Fallback: go directly to signin page
             try:
                 print("[Fortune Wheelz] Trying direct signin URL...")
                 driver.get(LOGIN_URL)
@@ -387,34 +498,63 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
 
     try:
         driver.get(PROMOTIONS_URL)
-        await asyncio.sleep(10)
+        await asyncio.sleep(8)
     except Exception as e:
         print(f"[Fortune Wheelz] Promotions navigation error: {e}")
 
     _close_popups(driver)
 
-    # This refresh pattern is from the newer working claim code.
+    # Keep the refresh behavior from the working claim version,
+    # but check countdown after each refresh so we do not click a "Next in" button.
     for i in range(1, 4):
+        print(f"[Fortune Wheelz] Checking countdown before refresh pass {i}...")
+
+        countdown = _read_countdown(driver)
+        if countdown:
+            await _send_screenshot(
+                channel,
+                driver,
+                f"Next Fortune Wheelz Bonus Available in: {countdown}",
+                "fortunewheelz_countdown.png"
+            )
+            return
+
         print(f"[Fortune Wheelz] Refreshing promotions pass {i}...")
+
         try:
             driver.refresh()
-            await asyncio.sleep(10)
+            await asyncio.sleep(8)
             _close_popups(driver)
         except Exception as e:
             print(f"[Fortune Wheelz] Refresh pass {i} failed: {e}")
 
-    # Try to open the daily login reward modal/card.
-    print("[Fortune Wheelz] Attempting to click claim reward button...")
+    # Final countdown check after refreshes.
+    countdown = _read_countdown(driver)
+    if countdown:
+        await _send_screenshot(
+            channel,
+            driver,
+            f"Next Fortune Wheelz Bonus Available in: {countdown}",
+            "fortunewheelz_countdown.png"
+        )
+        return
 
-    try:
-        reward = _wait_clickable(driver, By.XPATH, CLAIM_REWARD_XPATH, timeout=10)
-        _safe_click(driver, reward, "claim reward button")
-        await asyncio.sleep(10)
-    except Exception as e:
-        print(f"[Fortune Wheelz] Reward button failed: {e}")
+    # Find the daily reward card/button.
+    print("[Fortune Wheelz] Looking for daily reward promo button...")
 
-        # If reward button is disabled/unavailable, try countdown immediately.
-        countdown = _read_countdown(driver)
+    reward = _find_daily_reward_button(driver)
+
+    if not reward:
+        print("[Fortune Wheelz] Daily reward promo button not found.")
+        await _send_countdown_or_unavailable(channel, driver)
+        return
+
+    reward_text = _element_text(driver, reward)
+    print(f"[Fortune Wheelz] Daily reward button text: {reward_text!r}")
+
+    # Hard stop: do NOT click if it is a countdown/disabled-looking card.
+    if _button_looks_disabled(driver, reward):
+        countdown = _normalize_countdown(reward_text) or _read_countdown(driver)
 
         if countdown:
             await _send_screenshot(
@@ -425,11 +565,47 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
             )
             return
 
-    # Try the final daily-login claim button.
+        await _send_screenshot(
+            channel,
+            driver,
+            "Fortune Wheelz Daily Bonus Unavailable.",
+            "fortunewheelz_claim_error.png"
+        )
+        return
+
+    # Open the daily reward modal/card only if it does NOT say Next in.
+    print("[Fortune Wheelz] Attempting to click daily reward promo button...")
+
+    if not _safe_click(driver, reward, "daily reward promo button"):
+        print("[Fortune Wheelz] Could not click daily reward promo button.")
+        await _send_countdown_or_unavailable(channel, driver)
+        return
+
+    await asyncio.sleep(5)
+
+    # Sometimes the modal opens and shows a countdown instead of claim.
+    countdown = _read_countdown(driver)
+    if countdown:
+        await _send_screenshot(
+            channel,
+            driver,
+            f"Next Fortune Wheelz Bonus Available in: {countdown}",
+            "fortunewheelz_countdown.png"
+        )
+        return
+
+    # Click the final daily-login claim button.
     print("[Fortune Wheelz] Attempting to claim daily bonus...")
 
     try:
         claim = _wait_clickable(driver, By.XPATH, CLAIM_BUTTON_XPATH, timeout=10)
+        claim_text = _element_text(driver, claim)
+        print(f"[Fortune Wheelz] Final claim button text: {claim_text!r}")
+
+        if _button_looks_disabled(driver, claim):
+            print("[Fortune Wheelz] Final claim button looks disabled/countdown. Not clicking.")
+            await _send_countdown_or_unavailable(channel, driver)
+            return
 
         if not _safe_click(driver, claim, "daily login claim button"):
             raise Exception("Could not click daily login claim button.")
@@ -447,3 +623,14 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
         print("[Fortune Wheelz] Claim failed:", e)
 
         await _send_countdown_or_unavailable(channel, driver)
+
+
+# ───────────────────────────────────────────────────────────
+# Backwards Compatibility
+# ───────────────────────────────────────────────────────────
+
+async def fortunewheelz_flow(ctx, driver, channel):
+    """
+    Backwards-compatible wrapper for older main.py versions.
+    """
+    await fortunewheelz_casino(ctx, driver, channel)
