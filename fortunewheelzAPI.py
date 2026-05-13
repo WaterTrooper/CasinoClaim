@@ -1,15 +1,15 @@
 # Drake Hooks + WaterTrooper
 # Casino Claim 3
 # Fortune Wheelz API
-# Version 3.5
+# Version 3.6
 # Updated 2026.05.12
 #
 # Notes:
 # - Keeps the working Fortune Wheelz claim flow.
 # - Fixes false-positive claims when the promo card says "Next in HH:MM:SS".
 # - Reads countdown before trying to click the daily reward card.
-# - Uses the new countdown XPath fallback:
-#   /html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[4]/div/div[1]/div[2]/button
+# - Countdown sends text only — no screenshot.
+# - Screenshots only on successful claim, login timeout, or real error/unavailable.
 # - Keeps backwards compatibility with main.py by exposing both:
 #   fortunewheelz_casino()
 #   fortunewheelz_flow()
@@ -52,7 +52,7 @@ CLAIM_REWARD_XPATH = "//button[@data-tid='promo-daily-login-button']"
 CLAIM_BUTTON_XPATH = "//button[@data-tid='daily-login-btn']"
 
 # Exact daily reward countdown buttons.
-# New one from your screenshot is first.
+# Your newest countdown XPath is first.
 DAILY_CARD_COUNTDOWN_XPATHS = [
     "/html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[4]/div/div[1]/div[2]/button",
     "/html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[3]/div/div[1]/div[2]/button",
@@ -69,19 +69,17 @@ MODAL_COUNTDOWN_XPATHS = [
     "/html/body/div[9]/div/div[2]/div[3]/p",
 ]
 
-# Generic but still scoped to the daily login promo button.
+# Countdown locators stay scoped to the Daily Reward card/modal
+# so it does not accidentally grab tournament timers.
 COUNTDOWN_LOCATORS = [
-    # Your exact daily card paths.
     *[(By.XPATH, xp) for xp in DAILY_CARD_COUNTDOWN_XPATHS],
 
-    # Any Daily Reward promo button saying Next in / containing HH:MM:SS.
     (
         By.XPATH,
         "//button[@data-tid='promo-daily-login-button' "
         "and (contains(normalize-space(.), 'Next in') or contains(normalize-space(.), ':'))]"
     ),
 
-    # CSS class says disabled and text has countdown.
     (
         By.XPATH,
         "//button[@data-tid='promo-daily-login-button' "
@@ -89,10 +87,8 @@ COUNTDOWN_LOCATORS = [
         "and contains(normalize-space(.), ':')]"
     ),
 
-    # Modal paragraph fallback.
     *[(By.XPATH, xp) for xp in MODAL_COUNTDOWN_XPATHS],
 
-    # Final fallback: any disabled-ish button that says Next in.
     (
         By.XPATH,
         "//button[contains(@class, 'disabled') "
@@ -149,7 +145,6 @@ def _safe_click(driver, element, label="element") -> bool:
             "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
             element
         )
-        asyncio.sleep(0)
     except Exception:
         pass
 
@@ -233,8 +228,10 @@ def _button_looks_disabled(driver, element) -> bool:
     for attr in ("disabled", "aria-disabled"):
         try:
             value = (element.get_attribute(attr) or "").strip().lower()
+
             if value in {"true", "disabled", "1"}:
                 return True
+
         except Exception:
             pass
 
@@ -292,7 +289,6 @@ def _find_daily_reward_button(driver):
     if not buttons:
         return None
 
-    # Prefer the first visible daily reward promo button.
     for btn in buttons:
         try:
             if btn.is_displayed():
@@ -392,24 +388,32 @@ async def _send_screenshot(channel, driver, message, filename):
             pass
 
 
+async def _send_countdown(channel, countdown: str):
+    """
+    Countdown should be text only.
+    No screenshot here.
+    """
+    await channel.send(f"Next Fortune Wheelz Bonus Available in: {countdown}")
+
+
 async def _send_countdown_or_unavailable(channel, driver):
+    """
+    Sends countdown as plain text if found.
+    Screenshots only if no countdown candidate can be found.
+    """
     countdown = _read_countdown(driver)
 
     if countdown:
-        await _send_screenshot(
-            channel,
-            driver,
-            f"Next Fortune Wheelz Bonus Available in: {countdown}",
-            "fortunewheelz_countdown.png"
-        )
+        await _send_countdown(channel, countdown)
         return True
 
     await _send_screenshot(
         channel,
         driver,
-        "Fortune Wheelz Daily Bonus Unavailable.",
+        "Fortune Wheelz Daily Bonus Unavailable. Could not find a countdown candidate.",
         "fortunewheelz_claim_error.png"
     )
+
     return False
 
 
@@ -510,13 +514,9 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
         print(f"[Fortune Wheelz] Checking countdown before refresh pass {i}...")
 
         countdown = _read_countdown(driver)
+
         if countdown:
-            await _send_screenshot(
-                channel,
-                driver,
-                f"Next Fortune Wheelz Bonus Available in: {countdown}",
-                "fortunewheelz_countdown.png"
-            )
+            await _send_countdown(channel, countdown)
             return
 
         print(f"[Fortune Wheelz] Refreshing promotions pass {i}...")
@@ -530,13 +530,9 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
 
     # Final countdown check after refreshes.
     countdown = _read_countdown(driver)
+
     if countdown:
-        await _send_screenshot(
-            channel,
-            driver,
-            f"Next Fortune Wheelz Bonus Available in: {countdown}",
-            "fortunewheelz_countdown.png"
-        )
+        await _send_countdown(channel, countdown)
         return
 
     # Find the daily reward card/button.
@@ -557,18 +553,13 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
         countdown = _normalize_countdown(reward_text) or _read_countdown(driver)
 
         if countdown:
-            await _send_screenshot(
-                channel,
-                driver,
-                f"Next Fortune Wheelz Bonus Available in: {countdown}",
-                "fortunewheelz_countdown.png"
-            )
+            await _send_countdown(channel, countdown)
             return
 
         await _send_screenshot(
             channel,
             driver,
-            "Fortune Wheelz Daily Bonus Unavailable.",
+            "Fortune Wheelz Daily Bonus Unavailable. Daily reward button looked disabled, but no countdown was found.",
             "fortunewheelz_claim_error.png"
         )
         return
@@ -585,13 +576,9 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
 
     # Sometimes the modal opens and shows a countdown instead of claim.
     countdown = _read_countdown(driver)
+
     if countdown:
-        await _send_screenshot(
-            channel,
-            driver,
-            f"Next Fortune Wheelz Bonus Available in: {countdown}",
-            "fortunewheelz_countdown.png"
-        )
+        await _send_countdown(channel, countdown)
         return
 
     # Click the final daily-login claim button.
