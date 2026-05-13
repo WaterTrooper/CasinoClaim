@@ -513,6 +513,87 @@ async def _call_winbonanza(channel=None, ctx=None, raise_errors: bool = False):
         return None
 
 
+async def _call_fortunewheelz(channel=None, ctx=None, raise_errors: bool = False):
+    """
+    Safe Fortune Wheelz wrapper.
+
+    Newer Fortune Wheelz API files use `fortunewheelz_casino`.
+    Older main.py files called `fortunewheelz_flow`, which causes:
+      NameError: name 'fortunewheelz_flow' is not defined
+
+    This wrapper accepts either function name so main.py will not break
+    if the API file changes again.
+    """
+    target = ctx or channel
+
+    fn = _get_api_callable(
+        "fortunewheelzAPI",
+        "fortunewheelz_casino",
+        "fortunewheelz_flow",
+    )
+
+    if not fn:
+        import_error = API_IMPORT_ERRORS.get("fortunewheelzAPI")
+
+        if import_error:
+            await _send_long_message(
+                target,
+                "❌ `fortunewheelzAPI` is not available.\n"
+                "The import failed. Exact reason:\n"
+                f"```text\n{import_error[:1600]}\n```"
+            )
+
+            if len(import_error) > 1600:
+                await _send_long_message(
+                    target,
+                    "More import detail:\n"
+                    f"```text\n{import_error[1600:3200]}\n```"
+                )
+        else:
+            await _send_long_message(
+                target,
+                "❌ `fortunewheelzAPI` imported, but no callable was found.\n"
+                "Expected one of: `fortunewheelz_casino` or `fortunewheelz_flow`."
+            )
+
+        if raise_errors:
+            raise RuntimeError("fortunewheelzAPI is unavailable. Run !imports fortunewheelz for details.")
+
+        return None
+
+    try:
+        try:
+            sig = inspect.signature(fn)
+            params = sig.parameters
+
+            if len(params) >= 3:
+                result = fn(ctx, driver, channel)
+            elif "channel" in params and "ctx" in params:
+                result = fn(channel=channel, ctx=ctx)
+            elif "channel" in params:
+                result = fn(channel=channel)
+            elif "ctx" in params:
+                result = fn(ctx=ctx)
+            elif len(params) >= 1:
+                result = fn(channel)
+            else:
+                result = fn()
+
+        except (ValueError, TypeError):
+            result = fn(ctx, driver, channel)
+
+        return await _maybe_await(result)
+
+    except Exception as e:
+        msg = f"⚠️ Fortune Wheelz error: `{type(e).__name__}: {e}`"
+        await _send_long_message(target, msg)
+
+        if raise_errors:
+            raise
+
+        return None
+
+
 # ───────────────────────────────────────────────────────────
 # Discord setup
 # ───────────────────────────────────────────────────────────
@@ -833,7 +914,7 @@ async def _run_stake(channel):
 
 
 async def _run_fortunewheelz(channel):
-    await fortunewheelz_flow(None, driver, channel)
+    await _call_fortunewheelz(channel=channel, ctx=None, raise_errors=True)
 
 
 async def _run_spinquest(channel):
@@ -911,6 +992,10 @@ CASINO_ALIAS_MAP = {
     "yay": "yaycasino",
     "rp": "realprize",
     "real prize": "realprize",
+    "fortunewheelz": "fortunewheelz",
+    "fortune wheelz": "fortunewheelz",
+    "fortune-wheelz": "fortunewheelz",
+    "fzw": "fortunewheelz",
     "a_luck": "americanluck",
     "aluck": "americanluck",
     "american luck": "americanluck",
@@ -2541,10 +2626,10 @@ async def stake_cmd(ctx):
     await stake_claim(driver, bot, ctx, bot.get_channel(DISCORD_CHANNEL))
 
 
-@bot.command(name="fortunewheelz")
+@bot.command(name="fortunewheelz", aliases=["fortunewheelz", "fortune wheelz", "fortune-wheelz"])
 async def fortunewheelz_cmd(ctx):
     await ctx.send("Checking Fortune Wheelz for bonus…")
-    await fortunewheelz_flow(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _call_fortunewheelz(channel=bot.get_channel(DISCORD_CHANNEL), ctx=ctx, raise_errors=False)
 
 
 @bot.command(name="fortunewins", aliases=["fortune wins", "fw", "fortune coins", "fc", "fortunecoins"])
@@ -2669,7 +2754,7 @@ async def debug_cmd(ctx, *, casino: str):
         "rollingriches": lambda: rolling_riches_casino(ctx, driver, channel),
         "luckyland": lambda: luckyland_uc(ctx, channel),
         "stake": lambda: stake_claim(driver, bot, ctx, channel),
-        "fortunewheelz": lambda: fortunewheelz_flow(ctx, driver, channel),
+        "fortunewheelz": lambda: _call_fortunewheelz(channel=channel, ctx=ctx, raise_errors=True),
         "spinquest": lambda: spinquest_flow(ctx, driver, channel),
         "spinpals": lambda: spinpals_flow(ctx, driver, channel),
         "chumba": lambda: chumba_cmd(ctx),
