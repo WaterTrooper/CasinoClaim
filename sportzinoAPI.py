@@ -156,7 +156,7 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
             except Exception as e:
                 print(f"[Sportzino][ERROR] Login fields/captcha error: {e}")
                 await _send_screenshot(sb, channel, "sportzino_login_error.png",
-                                       "Sportzino: login fields not found / captcha gating.")
+                                       "[Sportzino] login fields not found / captcha gating.")
                 return
 
             # Submit (Enter on password first; fallback to explicit button)
@@ -174,7 +174,7 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
                 )
             if not submitted:
                 await _send_screenshot(sb, channel, "sportzino_submit_fail.png",
-                                       "Sportzino: could not submit login.")
+                                       "[Sportzino] could not submit login.")
                 return
 
             # Post-login settle
@@ -204,7 +204,7 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
             if not opened_rewards:
                 print("[Sportzino] Rewards/Coins section not found.")
                 await _send_screenshot(sb, channel, "sportzino_rewards_missing.png",
-                                       "Sportzino: Rewards/Coins section not found.")
+                                       "[Sportzino] Rewards/Coins section not found.")
                 return
 
             sb.wait(10)  # Give rewards UI time to render
@@ -242,7 +242,7 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
         try:
             with SB(uc=True, headed=True) as sb_fallback:
                 await _send_screenshot(sb_fallback, channel, "sportzino_exception.png",
-                                       f"Sportzino: exception during automation — {e}")
+                                       f"[Sportzino] exception during automation — {e}")
         except Exception:
             # If even fallback browser fails, at least send text.
             await channel.send(f"[Sportzino][ERROR] Exception during automation: {e}")
