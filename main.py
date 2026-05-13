@@ -2626,7 +2626,7 @@ async def stake_cmd(ctx):
     await stake_claim(driver, bot, ctx, bot.get_channel(DISCORD_CHANNEL))
 
 
-@bot.command(name="fortunewheelz", aliases=["fortunewheelz", "fortune wheelz", "fortune-wheelz"])
+@bot.command(name="fortunewheelz", aliases=["fortune wheelz", "fortune-wheelz", "fzw"])
 async def fortunewheelz_cmd(ctx):
     await ctx.send("Checking Fortune Wheelz for bonus…")
     await _call_fortunewheelz(channel=bot.get_channel(DISCORD_CHANNEL), ctx=ctx, raise_errors=False)
