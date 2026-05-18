@@ -1,7 +1,7 @@
 # Drake Hooks + WaterTrooper
 # Casino Claim 3
 # Fortune Wheelz API
-# Version 3.7
+# Version 3.8
 # Updated 2026.05.13
 #
 # Notes:
@@ -9,7 +9,9 @@
 #     1) a valid claim button
 #     2) an "available for HH:MM:SS" timer
 # - Does NOT mistake "REWARD IS AVAILABLE FOR HH:MM:SS" as the next-claim countdown.
-# - Only treats "Next in HH:MM:SS" / "come back" style timers as unavailable countdowns.
+# - Finds newer card countdown text like:
+#     "Next reward in 08:09:01"
+# - Only treats "Next in", "Next reward in", "come back", etc. as unavailable countdowns.
 # - Countdown sends text only — no screenshot.
 # - Screenshots on successful claim, login timeout, or real error/no countdown candidate.
 # - Keeps backwards compatibility with main.py by exposing both:
@@ -50,15 +52,20 @@ LOGIN_SUBMIT_XPATH = "//button[@data-tid='login-btn']"
 # Important: this same selector can be either available OR "Next in HH:MM:SS".
 CLAIM_REWARD_XPATH = "//button[@data-tid='promo-daily-login-button']"
 
+# Daily reward promo-card container.
+DAILY_REWARD_CARD_XPATH = (
+    "//div[@data-tid='promo-daily-login-card' "
+    "or contains(@data-tid, 'daily-login-card') "
+    "or contains(@data-tid, 'promo-daily-login')]"
+)
+
 # Final claim button inside the Daily Reward modal.
 CLAIM_BUTTON_XPATH = "//button[@data-tid='daily-login-btn']"
 
 # Final claim button fallbacks.
-# Your newest fallback XPath is included here.
 CLAIM_BUTTON_LOCATORS = [
     (By.XPATH, "//button[@data-tid='daily-login-btn']"),
 
-    # Modal scoped collect buttons.
     (
         By.XPATH,
         "//div[@id='ModalDailyLogin']//button["
@@ -68,7 +75,7 @@ CLAIM_BUTTON_LOCATORS = [
         "'abcdefghijklmnopqrstuvwxyz', 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'), 'CLAIM')]"
     ),
 
-    # Your fallback absolute XPath.
+    # Known modal absolute fallback.
     (By.XPATH, "/html/body/div[4]/div/div[2]/div[3]/button"),
 
     # Other common modal index fallbacks.
@@ -79,7 +86,6 @@ CLAIM_BUTTON_LOCATORS = [
     (By.XPATH, "/html/body/div[8]/div/div[2]/div[3]/button"),
     (By.XPATH, "/html/body/div[9]/div/div[2]/div[3]/button"),
 
-    # Generic visible collect/claim button fallback.
     (
         By.XPATH,
         "//button["
@@ -92,9 +98,14 @@ CLAIM_BUTTON_LOCATORS = [
     ),
 ]
 
-# Exact daily reward card countdown buttons.
-# These should only be considered "unavailable" if the text says "Next in" or similar.
+# Exact daily reward card countdown paths.
+# Includes newer card-header countdown:
+# <p class="p4-medium uppercase color-overlay-white-060">Next reward in 08:09:01</p>
 DAILY_CARD_COUNTDOWN_XPATHS = [
+    # New card header countdown XPath from screenshot.
+    "/html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[4]/div/div[1]/div[1]/div/p",
+
+    # Older disabled button countdown paths.
     "/html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[4]/div/div[1]/div[2]/button",
     "/html/body/div[1]/div/div/div[2]/main/div/div[1]/div[2]/div[3]/div/div[1]/div[2]/button",
 ]
@@ -116,10 +127,42 @@ MODAL_COUNTDOWN_XPATHS = [
 CARD_NEXT_COUNTDOWN_LOCATORS = [
     *[(By.XPATH, xp) for xp in DAILY_CARD_COUNTDOWN_XPATHS],
 
+    # Best current selector for the new p-based timer.
+    (
+        By.XPATH,
+        DAILY_REWARD_CARD_XPATH
+        + "//*[contains(translate(normalize-space(.), "
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next reward') "
+        "and contains(normalize-space(.), ':')]"
+    ),
+
+    # Specific class pattern from screenshot.
+    (
+        By.XPATH,
+        "//p[contains(@class, 'p4-medium') "
+        "and contains(@class, 'uppercase') "
+        "and contains(@class, 'color-overlay-white') "
+        "and contains(translate(normalize-space(.), "
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next reward') "
+        "and contains(normalize-space(.), ':')]"
+    ),
+
+    # More flexible text-only fallback for this exact copy.
+    (
+        By.XPATH,
+        "//*[contains(translate(normalize-space(.), "
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next reward in') "
+        "and contains(normalize-space(.), ':')]"
+    ),
+
+    # Older button countdown.
     (
         By.XPATH,
         "//button[@data-tid='promo-daily-login-button' "
-        "and (contains(normalize-space(.), 'Next in') or contains(normalize-space(.), ':'))]"
+        "and (contains(normalize-space(.), 'Next in') "
+        "or contains(translate(normalize-space(.), "
+        "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'next reward') "
+        "or contains(normalize-space(.), ':'))]"
     ),
 
     (
@@ -201,6 +244,7 @@ def _safe_click(driver, element, label="element") -> bool:
 def _normalize_countdown(text: str) -> str | None:
     """
     Accepts:
+      - Next reward in 08:09:01
       - Next in 02:45:59
       - 02:45:59
       - 2 : 45 : 59
@@ -211,6 +255,9 @@ def _normalize_countdown(text: str) -> str | None:
     """
     if not text:
         return None
+
+    # Handle &nbsp; / non-breaking spaces.
+    text = text.replace("\xa0", " ")
 
     match = re.search(r"(\d{1,2})\s*:\s*(\d{2})\s*:\s*(\d{2})", text)
 
@@ -243,7 +290,8 @@ def _element_text(driver, element) -> str:
     except Exception:
         pass
 
-    return " ".join(t.strip() for t in texts if t and t.strip()).strip()
+    combined = " ".join(t.strip() for t in texts if t and t.strip()).strip()
+    return combined.replace("\xa0", " ")
 
 
 def _element_has_disabled_marker(element) -> bool:
@@ -279,7 +327,7 @@ def _extract_next_claim_countdown(text: str, allow_bare_time: bool = False) -> s
     if not text:
         return None
 
-    raw = " ".join(text.split())
+    raw = " ".join(text.replace("\xa0", " ").split())
     lower = raw.lower()
 
     countdown = _normalize_countdown(raw)
@@ -287,19 +335,20 @@ def _extract_next_claim_countdown(text: str, allow_bare_time: bool = False) -> s
     if not countdown:
         return None
 
-    # Critical distinction from your screenshot.
+    # Critical distinction:
     # This is NOT the next-claim countdown.
     if "available for" in lower:
         return None
 
     next_claim_phrases = [
         "next in",
+        "next reward",
+        "next reward in",
+        "next bonus",
+        "available in",
         "come back",
         "tomorrow",
         "claim again",
-        "next reward",
-        "next bonus",
-        "available in",
         "unavailable",
         "cooldown",
     ]
@@ -317,7 +366,6 @@ def _button_is_next_claim_countdown(driver, element) -> bool:
     text = _element_text(driver, element)
     disabled = _element_has_disabled_marker(element)
 
-    # If button says "Next in HH:MM:SS", it is unavailable.
     if _extract_next_claim_countdown(text, allow_bare_time=disabled):
         return True
 
@@ -337,29 +385,53 @@ def _read_next_claim_countdown(driver, include_modal: bool = False) -> str | Non
     if include_modal:
         locators.extend((By.XPATH, xp) for xp in MODAL_COUNTDOWN_XPATHS)
 
+    best_candidate = None
+
     for by, value in locators:
         try:
             elements = driver.find_elements(by, value)
 
             for element in elements:
                 try:
+                    if not element.is_displayed():
+                        continue
+                except Exception:
+                    pass
+
+                try:
                     text = _element_text(driver, element)
                     disabled = _element_has_disabled_marker(element)
 
                     countdown = _extract_next_claim_countdown(
                         text,
-                        allow_bare_time=disabled and by == By.XPATH
+                        allow_bare_time=disabled
                     )
 
                     if countdown:
-                        print(f"[Fortune Wheelz] Next-claim countdown found: {countdown} from text: {text!r}")
+                        print(
+                            f"[Fortune Wheelz] Next-claim countdown found: "
+                            f"{countdown} from text: {text!r}"
+                        )
                         return countdown
+
+                    # Keep a safe fallback candidate if the locator was already
+                    # card-scoped and text is only HH:MM:SS.
+                    if not best_candidate:
+                        bare = _normalize_countdown(text)
+                        lower = text.lower()
+
+                        if bare and "available for" not in lower:
+                            best_candidate = bare
 
                 except Exception:
                     continue
 
         except Exception:
             continue
+
+    if best_candidate:
+        print(f"[Fortune Wheelz] Using fallback countdown candidate: {best_candidate}")
+        return best_candidate
 
     return None
 
@@ -369,7 +441,7 @@ def _find_daily_reward_button(driver):
     Finds the Fortune Wheelz daily login promo button.
     This can be either:
       - Available claim button
-      - Disabled-looking countdown button: Next in HH:MM:SS
+      - Disabled-looking countdown button.
     """
     try:
         buttons = driver.find_elements(By.XPATH, CLAIM_REWARD_XPATH)
@@ -410,12 +482,10 @@ def _find_final_claim_button(driver, timeout_per_locator=3):
             text = _element_text(driver, button)
             print(f"[Fortune Wheelz] Claim button candidate text: {text!r}")
 
-            # Reject buttons that are clearly next-countdown/unavailable buttons.
             if _button_is_next_claim_countdown(driver, button):
                 print("[Fortune Wheelz] Candidate is a next-countdown button, not claim.")
                 continue
 
-            # Reject true disabled buttons.
             if _element_has_disabled_marker(button):
                 print("[Fortune Wheelz] Candidate has disabled marker, skipping.")
                 continue
@@ -641,7 +711,7 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
     _close_popups(driver)
 
     # Keep the refresh behavior from the working claim version.
-    # Only read CARD "Next in" countdown here.
+    # Only read CARD next-claim countdown here.
     # Do NOT read modal availability timers before trying claim.
     for i in range(1, 4):
         print(f"[Fortune Wheelz] Checking card next-claim countdown before refresh pass {i}...")
@@ -668,7 +738,6 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
         await _send_countdown(channel, countdown)
         return
 
-    # Find the daily reward card/button.
     print("[Fortune Wheelz] Looking for daily reward promo button...")
 
     reward = _find_daily_reward_button(driver)
@@ -681,7 +750,7 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
     reward_text = _element_text(driver, reward)
     print(f"[Fortune Wheelz] Daily reward button text: {reward_text!r}")
 
-    # Hard stop: do NOT click if the card is a "Next in" countdown.
+    # Hard stop: do NOT click if the card is a next-claim countdown.
     if _button_is_next_claim_countdown(driver, reward):
         countdown = _extract_next_claim_countdown(
             reward_text,
@@ -700,13 +769,11 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
         )
         return
 
-    # Also reject true disabled card.
     if _element_has_disabled_marker(reward):
         print("[Fortune Wheelz] Daily reward button has disabled marker.")
         await _send_countdown_or_unavailable(channel, driver, include_modal=False)
         return
 
-    # Open the daily reward modal/card.
     print("[Fortune Wheelz] Attempting to click daily reward promo button...")
 
     if not _safe_click(driver, reward, "daily reward promo button"):
@@ -716,9 +783,7 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
 
     await asyncio.sleep(5)
 
-    # IMPORTANT:
-    # Try the final claim button BEFORE reading modal countdown text.
-    # The modal can show "REWARD IS AVAILABLE FOR 22:57:59" while claim is valid.
+    # Try final claim button BEFORE reading modal countdown text.
     print("[Fortune Wheelz] Looking for final modal claim button...")
 
     claim = _find_final_claim_button(driver, timeout_per_locator=3)
@@ -744,7 +809,6 @@ async def claim_fortunewheelz_bonus(ctx, driver, channel):
         except Exception as e:
             print(f"[Fortune Wheelz] Final claim click failed: {e}")
 
-    # Only now read modal countdowns, and still ignore "available for".
     print("[Fortune Wheelz] Final claim button not found/clickable. Checking true next-claim countdown...")
 
     await _send_countdown_or_unavailable(channel, driver, include_modal=True)
