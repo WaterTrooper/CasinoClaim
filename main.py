@@ -11,6 +11,7 @@ import shutil
 import signal
 import inspect
 import traceback
+import logging
 import discord
 import asyncio
 import importlib
@@ -69,14 +70,42 @@ if not DISCORD_CHANNEL_RAW:
 
 DISCORD_CHANNEL = int(DISCORD_CHANNEL_RAW)
 
+DISCORD_HEARTBEAT_TIMEOUT = float(os.getenv("DISCORD_HEARTBEAT_TIMEOUT", "300"))
+DISCORD_GATEWAY_LOG_LEVEL = os.getenv("DISCORD_GATEWAY_LOG_LEVEL", "WARNING").upper()
+RUN_CASINOS_IN_WORKER_THREAD = os.getenv("RUN_CASINOS_IN_WORKER_THREAD", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO),
+    format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+)
+logging.getLogger("discord.gateway").setLevel(
+    getattr(logging, DISCORD_GATEWAY_LOG_LEVEL, logging.WARNING)
+)
+logging.getLogger("discord.client").setLevel(logging.INFO)
+
 
 # ───────────────────────────────────────────────────────────
 # Executor tracking
 # ───────────────────────────────────────────────────────────
-_executor = ThreadPoolExecutor(max_workers=4)
+_executor = ThreadPoolExecutor(max_workers=int(os.getenv("BOT_MISC_WORKERS", "4")))
+
+# One dedicated Selenium worker keeps Discord's asyncio heartbeat loop responsive.
+# Keep this at 1 worker because the shared Chrome driver/profile is not safe to
+# use from multiple casino checks at the same time.
+_casino_executor = ThreadPoolExecutor(max_workers=1)
 
 _active_exec_jobs = 0
 _active_exec_lock = threading.Lock()
+
+_casino_worker_lock = threading.Lock()
+_casino_worker_current_job: Optional[str] = None
+_casino_worker_started_at: Optional[dt.datetime] = None
+_worker_local = threading.local()
 
 
 def _exec_job_started():
@@ -89,6 +118,43 @@ def _exec_job_finished():
     global _active_exec_jobs
     with _active_exec_lock:
         _active_exec_jobs = max(0, _active_exec_jobs - 1)
+
+
+def _casino_worker_started(label: str) -> None:
+    global _casino_worker_current_job, _casino_worker_started_at
+
+    with _casino_worker_lock:
+        _casino_worker_current_job = label
+        _casino_worker_started_at = dt.datetime.now(dt.timezone.utc)
+
+
+def _casino_worker_finished() -> None:
+    global _casino_worker_current_job, _casino_worker_started_at
+
+    with _casino_worker_lock:
+        _casino_worker_current_job = None
+        _casino_worker_started_at = None
+
+
+def _casino_worker_status() -> dict:
+    with _casino_worker_lock:
+        label = _casino_worker_current_job
+        started = _casino_worker_started_at
+
+    age_seconds = None
+    if started is not None:
+        age_seconds = int((dt.datetime.now(dt.timezone.utc) - started).total_seconds())
+
+    return {
+        "active": bool(label),
+        "label": label,
+        "started_at": started,
+        "age_seconds": age_seconds,
+    }
+
+
+def _casino_worker_busy() -> bool:
+    return bool(_casino_worker_status()["active"])
 
 
 # ───────────────────────────────────────────────────────────
@@ -353,6 +419,258 @@ async def _send_long_message(target, text: str):
             pass
 
 
+class MainLoopMessageProxy:
+    """
+    Small proxy used by the Selenium worker thread.
+
+    It lets casino APIs keep doing `await channel.send(...)`, while the actual
+    Discord send runs safely on the real Discord/bot event loop.
+    """
+
+    def __init__(self, target, main_loop: asyncio.AbstractEventLoop):
+        self._target = target
+        self._main_loop = main_loop
+        self.id = getattr(target, "id", None)
+        self.name = getattr(target, "name", None)
+        self.guild = getattr(target, "guild", None)
+
+    @property
+    def channel(self):
+        return self
+
+    async def send(self, *args, **kwargs):
+        if self._main_loop.is_closed():
+            return None
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._target.send(*args, **kwargs),
+            self._main_loop,
+        )
+        return await asyncio.wrap_future(future)
+
+    def __getattr__(self, item):
+        return getattr(self._target, item)
+
+
+class MainLoopBotProxy:
+    """Proxy bot methods that must run on the real Discord event loop."""
+
+    def __init__(self, real_bot: commands.Bot, main_loop: asyncio.AbstractEventLoop):
+        self._bot = real_bot
+        self._main_loop = main_loop
+
+    def get_channel(self, channel_id):
+        channel = self._bot.get_channel(channel_id)
+        if channel is None:
+            return None
+        return MainLoopMessageProxy(channel, self._main_loop)
+
+    async def wait_for(self, *args, **kwargs):
+        future = asyncio.run_coroutine_threadsafe(
+            self._bot.wait_for(*args, **kwargs),
+            self._main_loop,
+        )
+        return await asyncio.wrap_future(future)
+
+    async def close(self):
+        future = asyncio.run_coroutine_threadsafe(self._bot.close(), self._main_loop)
+        return await asyncio.wrap_future(future)
+
+    def __getattr__(self, item):
+        return getattr(self._bot, item)
+
+
+class MainLoopContextProxy:
+    """Proxy command context used from the Selenium worker thread.
+
+    This keeps old API files working when they do `await ctx.send(...)` while the
+    casino code itself is running away from Discord's real event loop.
+    """
+
+    def __init__(self, ctx: commands.Context, main_loop: asyncio.AbstractEventLoop):
+        self._ctx = ctx
+        self._main_loop = main_loop
+        self.bot = MainLoopBotProxy(bot, main_loop)
+        self.channel = MainLoopMessageProxy(ctx.channel, main_loop)
+        self.guild = getattr(ctx, "guild", None)
+        self.author = getattr(ctx, "author", None)
+        self.message = getattr(ctx, "message", None)
+        self.command = getattr(ctx, "command", None)
+        self.prefix = getattr(ctx, "prefix", None)
+
+    async def send(self, *args, **kwargs):
+        if self._main_loop.is_closed():
+            return None
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._ctx.send(*args, **kwargs),
+            self._main_loop,
+        )
+        return await asyncio.wrap_future(future)
+
+    async def reply(self, *args, **kwargs):
+        if self._main_loop.is_closed():
+            return None
+
+        future = asyncio.run_coroutine_threadsafe(
+            self._ctx.reply(*args, **kwargs),
+            self._main_loop,
+        )
+        return await asyncio.wrap_future(future)
+
+    def typing(self):
+        return self._ctx.typing()
+
+    def __getattr__(self, item):
+        return getattr(self._ctx, item)
+
+
+def _bot():
+    return getattr(_worker_local, "bot_proxy", bot)
+
+
+def _run_runner_in_worker_thread(
+    runner: Callable[[discord.abc.Messageable], Awaitable[None]],
+    channel: discord.abc.Messageable,
+    main_loop: asyncio.AbstractEventLoop,
+    label: str,
+):
+    """Run one casino runner in the dedicated Selenium thread."""
+    proxy_channel = MainLoopMessageProxy(channel, main_loop)
+    _worker_local.bot_proxy = MainLoopBotProxy(bot, main_loop)
+    _casino_worker_started(label)
+
+    try:
+        async def _inner():
+            result = runner(proxy_channel)
+            return await _maybe_await(result)
+
+        return asyncio.run(_inner())
+
+    finally:
+        try:
+            delattr(_worker_local, "bot_proxy")
+        except Exception:
+            pass
+        _casino_worker_finished()
+
+
+async def _run_entry_without_blocking_discord(entry: Any, channel: discord.abc.Messageable):
+    """
+    Keep Discord alive by moving blocking Selenium work off the main asyncio loop.
+
+    FortuneCoins already uses its own blocking executor path that needs the real
+    Discord loop, so leave it on the main loop wrapper.
+    """
+    if not RUN_CASINOS_IN_WORKER_THREAD or entry.key == "fortunecoins":
+        return await entry.runner(channel)
+
+    main_loop = asyncio.get_running_loop()
+    return await main_loop.run_in_executor(
+        _casino_executor,
+        _run_runner_in_worker_thread,
+        entry.runner,
+        channel,
+        main_loop,
+        entry.display_name,
+    )
+
+
+async def _run_callable_without_blocking_discord(label: str, func, channel: discord.abc.Messageable):
+    if not RUN_CASINOS_IN_WORKER_THREAD:
+        result = func(channel)
+        return await _maybe_await(result)
+
+    main_loop = asyncio.get_running_loop()
+    return await main_loop.run_in_executor(
+        _casino_executor,
+        _run_runner_in_worker_thread,
+        func,
+        channel,
+        main_loop,
+        label,
+    )
+
+
+def _run_manual_action_in_worker_thread(label: str, ctx: commands.Context, main_loop: asyncio.AbstractEventLoop, action):
+    """Run a manual command's Selenium code away from Discord's event loop."""
+    proxy_ctx = MainLoopContextProxy(ctx, main_loop)
+    real_channel = bot.get_channel(DISCORD_CHANNEL) or ctx.channel
+    proxy_channel = MainLoopMessageProxy(real_channel, main_loop)
+
+    _worker_local.bot_proxy = MainLoopBotProxy(bot, main_loop)
+    _casino_worker_started(label)
+
+    try:
+        async def _inner():
+            result = action(proxy_ctx, proxy_channel)
+            return await _maybe_await(result)
+
+        return asyncio.run(_inner())
+
+    finally:
+        try:
+            delattr(_worker_local, "bot_proxy")
+        except Exception:
+            pass
+        _casino_worker_finished()
+
+
+async def _run_manual_casino_command(ctx: commands.Context, label: str, action, *, queued_message: bool = True):
+    """Queue one manual Selenium command without blocking Discord heartbeats.
+
+    `action` receives `(proxy_ctx, proxy_channel)`. Any `await ctx.send()` or
+    `await channel.send()` done by older API files is forwarded to the real
+    Discord loop safely.
+    """
+    if _casino_worker_busy():
+        worker = _casino_worker_status()
+        try:
+            await ctx.send(
+                f"⏳ Selenium worker is busy with `{worker['label']}` for ~{worker['age_seconds']}s. "
+                f"Queued `{label}` next. `!ping` and `!status` will still work."
+            )
+        except Exception:
+            pass
+    elif queued_message:
+        try:
+            await ctx.send(
+                f"`{label}` is running in the Selenium worker so Discord heartbeat/commands stay alive."
+            )
+        except Exception:
+            pass
+
+    if not RUN_CASINOS_IN_WORKER_THREAD:
+        try:
+            result = action(ctx, bot.get_channel(DISCORD_CHANNEL) or ctx.channel)
+            return await _maybe_await(result)
+        except Exception as e:
+            print(f"[Manual] Error in {label}: {type(e).__name__}: {e}")
+            traceback.print_exc()
+            await ctx.send(f"⚠️ `{label}` error: `{type(e).__name__}: {e}`")
+            return None
+
+    main_loop = asyncio.get_running_loop()
+
+    try:
+        return await main_loop.run_in_executor(
+            _casino_executor,
+            _run_manual_action_in_worker_thread,
+            label,
+            ctx,
+            main_loop,
+            action,
+        )
+    except Exception as e:
+        print(f"[Manual] Error in {label}: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        try:
+            await ctx.send(f"⚠️ `{label}` error: `{type(e).__name__}: {e}`")
+        except Exception:
+            pass
+        return None
+
+
 async def _call_luckparty(channel=None, ctx=None, raise_errors: bool = False):
     """
     Safe Luck Party wrapper.
@@ -600,7 +918,7 @@ async def _call_fortunewheelz(channel=None, ctx=None, raise_errors: bool = False
 intents = Intents.default()
 intents.message_content = True
 
-bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True)
+bot = commands.Bot(command_prefix="!", intents=intents, case_insensitive=True, heartbeat_timeout=DISCORD_HEARTBEAT_TIMEOUT)
 bot.remove_command("help")
 
 
@@ -732,7 +1050,8 @@ driver = _build_driver_with_retry(options)
 # ───────────────────────────────────────────────────────────
 bot.awaiting_2fa_for = None
 bot.pending_2fa_code = None
-bot._pending_2fa_event = asyncio.Event()
+bot._pending_2fa_event = threading.Event()
+bot._2fa_lock = threading.Lock()
 
 
 @bot.event
@@ -746,33 +1065,47 @@ async def on_message(message: discord.Message):
                 try:
                     bot._pending_2fa_event.set()
                 except Exception:
-                    bot._pending_2fa_event = asyncio.Event()
+                    bot._pending_2fa_event = threading.Event()
                     bot._pending_2fa_event.set()
             else:
                 bot.two_fa_code = text
                 print(f"[2FA] Stored code legacy fallback: {bot.two_fa_code}")
 
-    await bot.process_commands(message)
+    try:
+        await bot.process_commands(message)
+    except Exception as e:
+        print(f"[on_message] process_commands failed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+        try:
+            await message.channel.send(f"⚠️ Command handling error: `{type(e).__name__}: {e}`")
+        except Exception:
+            pass
 
 
 async def wait_for_2fa(site_name: str, timeout: int = 90) -> Optional[str]:
-    if bot.awaiting_2fa_for:
-        return None
+    """
+    Thread-safe 2FA capture.
 
-    bot.awaiting_2fa_for = site_name
-    bot.pending_2fa_code = None
-    bot._pending_2fa_event = asyncio.Event()
+    Casino checks may now run in the Selenium worker thread so Discord's heartbeat
+    loop stays alive. A normal asyncio.Event is tied to one event loop, so use a
+    threading.Event and wait on it without blocking whichever asyncio loop called us.
+    """
+    with bot._2fa_lock:
+        if bot.awaiting_2fa_for:
+            return None
+
+        bot.awaiting_2fa_for = site_name
+        bot.pending_2fa_code = None
+        bot._pending_2fa_event = threading.Event()
 
     try:
-        await asyncio.wait_for(bot._pending_2fa_event.wait(), timeout=timeout)
-    except asyncio.TimeoutError:
-        code = None
-    else:
-        code = bot.pending_2fa_code
-
-    bot.awaiting_2fa_for = None
-    bot.pending_2fa_code = None
-    bot._pending_2fa_event = asyncio.Event()
+        got_code = await asyncio.to_thread(bot._pending_2fa_event.wait, timeout)
+        code = bot.pending_2fa_code if got_code else None
+    finally:
+        with bot._2fa_lock:
+            bot.awaiting_2fa_for = None
+            bot.pending_2fa_code = None
+            bot._pending_2fa_event = threading.Event()
 
     return code
 
@@ -835,7 +1168,7 @@ async def _run_jefebet(channel):
 
 
 async def _run_crowncoins(channel):
-    await crowncoins_casino(driver, bot, None, channel)
+    await crowncoins_casino(driver, _bot(), None, channel)
 
 
 async def _run_smilescasino(channel):
@@ -899,10 +1232,10 @@ async def _run_winbonanza(channel):
 
 
 async def _run_modo(channel):
-    ok = await claim_modo_bonus(driver, bot, None, channel)
+    ok = await claim_modo_bonus(driver, _bot(), None, channel)
 
     if not ok:
-        await check_modo_countdown(driver, bot, None, channel)
+        await check_modo_countdown(driver, _bot(), None, channel)
 
 
 async def _run_rollingriches(channel):
@@ -910,7 +1243,7 @@ async def _run_rollingriches(channel):
 
 
 async def _run_stake(channel):
-    await stake_claim(driver, bot, None, channel)
+    await stake_claim(driver, _bot(), None, channel)
 
 
 async def _run_fortunewheelz(channel):
@@ -1488,7 +1821,7 @@ async def maybe_run_auto_tasks(channel):
 
     if AUTOAUTH_ENABLED and AUTOAUTH_NEXT_RUN is not None and now >= AUTOAUTH_NEXT_RUN:
         try:
-            await run_auto_google_auth(channel)
+            await _run_callable_without_blocking_discord("Autoauth Google", run_auto_google_auth, channel)
         finally:
             AUTOAUTH_NEXT_RUN = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=AUTOAUTH_INTERVAL_MINUTES)
 
@@ -1507,6 +1840,13 @@ async def run_main_loop(channel: discord.abc.Messageable):
     try:
         while main_loop_running:
             reload_config_if_changed()
+
+            if _casino_worker_busy():
+                # A previous Selenium run timed out from the scheduler's point of view,
+                # but the browser thread is still unwinding. Do not queue more browser work.
+                await asyncio.sleep(MAIN_TICK_SLEEP)
+                continue
+
             await maybe_run_auto_tasks(channel)
 
             now = dt.datetime.now(dt.timezone.utc)
@@ -1515,13 +1855,23 @@ async def run_main_loop(channel: discord.abc.Messageable):
                 if not entry.enabled:
                     continue
 
+                if _casino_worker_busy():
+                    break
+
                 if now >= entry.next_run:
+                    timed_out = False
+
                     try:
-                        await asyncio.wait_for(entry.runner(channel), timeout=PER_CASINO_TIMEOUT_SEC)
+                        await asyncio.wait_for(
+                            _run_entry_without_blocking_discord(entry, channel),
+                            timeout=PER_CASINO_TIMEOUT_SEC,
+                        )
                     except asyncio.TimeoutError:
+                        timed_out = True
                         try:
                             await channel.send(
-                                f"⏳ {entry.display_name} timed out after {PER_CASINO_TIMEOUT_SEC}s. Skipping."
+                                f"⏳ {entry.display_name} timed out after {PER_CASINO_TIMEOUT_SEC}s. "
+                                "Discord is still online; waiting for the Selenium worker to finish before queueing more."
                             )
                         except Exception:
                             pass
@@ -1534,6 +1884,9 @@ async def run_main_loop(channel: discord.abc.Messageable):
                             pass
                     finally:
                         entry.schedule_next()
+
+                    if timed_out:
+                        break
 
             await asyncio.sleep(MAIN_TICK_SLEEP)
 
@@ -1610,18 +1963,39 @@ async def run_modo_auth(channel):
 # Bot events / commands
 # ───────────────────────────────────────────────────────────
 @bot.event
+async def on_connect():
+    print("[Discord] Gateway connected.")
+
+
+@bot.event
+async def on_disconnect():
+    print("[Discord] Gateway disconnected. discord.py will reconnect automatically.")
+
+
+@bot.event
+async def on_resumed():
+    print("[Discord] Gateway session resumed.")
+
+
+@bot.event
 async def on_ready():
+    first_ready = not getattr(bot, "_startup_complete", False)
+    bot._startup_complete = True
+
     print(f"Bot has connected as {bot.user}")
     channel = bot.get_channel(DISCORD_CHANNEL)
 
-    if channel:
-        await channel.send("Discord bot has started…")
-        await asyncio.sleep(10)
-
-        if await start_main_loop(channel):
-            await channel.send("🎰 Casino loop started with current TOML configuration.")
-    else:
+    if not channel:
         print("Invalid DISCORD_CHANNEL")
+        return
+
+    if first_ready:
+        await channel.send("Discord bot has started…")
+
+    if await start_main_loop(channel):
+        await channel.send("🎰 Casino loop started with current TOML configuration.")
+    elif first_ready:
+        await channel.send("🎰 Casino loop is already running.")
 
 
 MANUAL_CASINO_COMMANDS = {
@@ -1744,7 +2118,16 @@ async def stop_loop_command(ctx: commands.Context):
     stopped = await stop_main_loop()
 
     if stopped:
-        await ctx.send("Casino loop stopped. You can run manual casino commands now.")
+        worker = _casino_worker_status()
+        msg = "Casino loop stopped. You can run manual casino commands now."
+
+        if worker["active"]:
+            msg += (
+                f"\n⚠️ `{worker['label']}` is still finishing in the Selenium worker "
+                "thread. Use `!status` to watch it, or `!restart` if Chrome is truly stuck."
+            )
+
+        await ctx.send(msg)
     else:
         await ctx.send("Casino loop is not currently running.")
 
@@ -2404,13 +2787,35 @@ async def config_autodataclear(ctx: dcommands.Context, action: str = "", value: 
 # ───────────────────────────────────────────────────────────
 @bot.command(name="ping")
 async def ping(ctx):
-    await ctx.send("Pong")
+    await ctx.send(f"Pong `{bot.latency * 1000:.0f}ms`")
 
 
-@bot.command(name="about")
-async def about(ctx):
-    await ctx.send("🔍 Retrieving Chrome version …")
+@bot.command(name="status")
+async def status_cmd(ctx):
+    worker = _casino_worker_status()
 
+    if worker["active"]:
+        worker_text = f"`{worker['label']}` for ~{worker['age_seconds']}s"
+    else:
+        worker_text = "`idle`"
+
+    with _active_exec_lock:
+        active_misc_jobs = _active_exec_jobs
+
+    await ctx.send(
+        "🧩 **CasinoClaim status**\n"
+        f"Discord ready: `{'yes' if bot.is_ready() else 'no'}`\n"
+        f"Discord latency: `{bot.latency * 1000:.0f}ms`\n"
+        f"Main loop: `{'running' if is_main_loop_running() else 'stopped'}`\n"
+        f"Selenium worker: {worker_text}\n"
+        f"Misc executor jobs: `{active_misc_jobs}`\n"
+        f"Worker-thread mode: `{'enabled' if RUN_CASINOS_IN_WORKER_THREAD else 'disabled'}`\n"
+        f"Heartbeat timeout: `{DISCORD_HEARTBEAT_TIMEOUT:g}s`\n"
+        f"Config: `{CONFIG_PATH}`"
+    )
+
+
+async def _about_chrome_worker(ctx, channel):
     driver.get("chrome://version/")
     await asyncio.sleep(2)
 
@@ -2432,6 +2837,12 @@ async def about(ctx):
             pass
 
 
+@bot.command(name="about")
+async def about(ctx):
+    await ctx.send("🔍 Retrieving Chrome version …")
+    await _run_manual_casino_command(ctx, "about:chrome", _about_chrome_worker, queued_message=False)
+
+
 @bot.command(name="restart")
 async def restart(ctx):
     await ctx.send("Restarting…")
@@ -2441,128 +2852,262 @@ async def restart(ctx):
 
 # ───────────────────────────────────────────────────────────
 # Manual casino commands
+# IMPORTANT:
+# Every Selenium-heavy manual command runs through _run_manual_casino_command().
+# This is what prevents commands like !zula from freezing Discord's heartbeat.
 # ───────────────────────────────────────────────────────────
+async def _manual_chumba_flow(ctx, channel):
+    driver.get("https://lobby.chumbacasino.com/")
+    await asyncio.sleep(5)
+
+    if driver.current_url.startswith("https://login.chumbacasino.com/"):
+        authenticated = await authenticate_chumba(driver, _bot(), ctx)
+
+        if not authenticated:
+            await ctx.send("Chumba authentication failed.")
+            return
+
+    if driver.current_url.startswith("https://lobby.chumbacasino.com/"):
+        await claim_chumba_bonus(driver, ctx)
+        await check_chumba_countdown(driver, ctx)
+    else:
+        await ctx.send("Failed to reach the Chumba lobby.")
+
+
+async def _manual_modo_flow(ctx, channel):
+    ok = await claim_modo_bonus(driver, _bot(), ctx, channel)
+
+    if not ok:
+        await check_modo_countdown(driver, _bot(), ctx, channel)
+
+
+async def _manual_dingdingding_flow(ctx, channel):
+    claimed = await claim_dingdingding_bonus(driver, _bot(), ctx, channel)
+
+    if not claimed:
+        await check_dingdingding_countdown(driver, _bot(), ctx, channel)
+
+
+async def _manual_fortunecoins_flow(ctx, channel):
+    """Fortune Coins/Fortune Wins has its own blocking entrypoint.
+
+    Run it inside the same single Selenium worker lane, but give it the real main
+    Discord loop so its existing cross-thread sends still work.
+    """
+    from fortunecoinsAPI import fortunecoins_uc_blocking
+
+    main_loop = getattr(channel, "_main_loop", None)
+    real_channel_id = getattr(channel, "id", None) or DISCORD_CHANNEL
+
+    if main_loop is None:
+        # Fallback for worker-thread mode disabled.
+        main_loop = asyncio.get_running_loop()
+
+    _exec_job_started()
+    try:
+        return fortunecoins_uc_blocking(_bot(), real_channel_id, main_loop)
+    finally:
+        _exec_job_finished()
+
+
 @bot.command(name="realprize", aliases=["real prize", "rp"])
 async def realprize_cmd(ctx):
     await ctx.send("Checking Real Prize for bonus…")
-    await realprize_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Real Prize",
+        lambda pctx, channel: realprize_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="zula", aliases=["zula casino", "zulacasino"])
 async def zula_cmd(ctx):
     await ctx.send("Checking Zula Casino for bonus…")
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    await zula_uc(ctx, channel)
+    await _run_manual_casino_command(
+        ctx,
+        "Zula Casino",
+        lambda pctx, channel: zula_uc(pctx, channel),
+    )
 
 
 @bot.command(name="sportzino")
 async def sportzino_cmd(ctx):
     await ctx.send("Checking Sportzino for bonus…")
-    await Sportzino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Sportzino",
+        lambda pctx, channel: Sportzino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="nolimitcoins", aliases=["nlc", "no limit", "no limit coins"])
 async def nolimitcoins_cmd(ctx):
     await ctx.send("Checking NoLimitCoins for bonus…")
-    await nolimitcoins_flow(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "NoLimitCoins",
+        lambda pctx, channel: nolimitcoins_flow(pctx, driver, channel),
+    )
 
 
 @bot.command(name="funrize")
 async def funrize_cmd(ctx):
     await ctx.send("Checking Funrize for bonus…")
-    await funrize_flow(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Funrize",
+        lambda pctx, channel: funrize_flow(pctx, driver, channel),
+    )
 
 
 @bot.command(name="yaycasino", aliases=["yay", "yay casino"])
 async def yaycasino_cmd(ctx):
     await ctx.send("Checking YayCasino for bonus…")
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    await yaycasino_uc(ctx, channel)
+    await _run_manual_casino_command(
+        ctx,
+        "YayCasino",
+        lambda pctx, channel: yaycasino_uc(pctx, channel),
+    )
 
 
 @bot.command(name="globalpoker", aliases=["gp", "global poker"])
 async def globalpoker_cmd(ctx):
     await ctx.send("Checking GlobalPoker for bonus…")
-    await global_poker(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "GlobalPoker",
+        lambda pctx, channel: global_poker(pctx, driver, channel),
+    )
 
 
 @bot.command(name="jefebet", aliases=["jefe", "jefebet casino", "jefe bet", "jb"])
 async def jefebet_cmd(ctx):
     await ctx.send("Checking JefeBet for bonus…")
-    await jefebet_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "JefeBet",
+        lambda pctx, channel: jefebet_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="smilescasino", aliases=["smiles", "smiles casino"])
 async def smilescasino_cmd(ctx):
     await ctx.send("Checking Smiles Casino for bonus...")
-    await smilescasino_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Smiles Casino",
+        lambda pctx, channel: smilescasino_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="jumbo")
 async def jumbo_cmd(ctx):
     await ctx.send("Checking Jumbo for bonus...")
-    await jumbo_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Jumbo",
+        lambda pctx, channel: jumbo_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="spree")
 async def spree_cmd(ctx):
     await ctx.send("Checking Spree for bonus...")
-    await spree_uc(ctx, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Spree",
+        lambda pctx, channel: spree_uc(pctx, channel),
+    )
 
 
 @bot.command(name="wildworld")
 async def wildworld_cmd(ctx):
     await ctx.send("Checking Wild World Casino for bonus...")
-    await wildworld_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Wild World",
+        lambda pctx, channel: wildworld_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="lonestar")
 async def lonestar_cmd(ctx):
     await ctx.send("Checking LoneStar Casino for bonus...")
-    await lonestar_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "LoneStar Casino",
+        lambda pctx, channel: lonestar_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="gains")
 async def gains_cmd(ctx):
     await ctx.send("Checking Gains for bonus...")
-    await gains_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Gains",
+        lambda pctx, channel: gains_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="stormrush")
 async def stormrush_cmd(ctx):
     await ctx.send("Checking Stormrush for bonus...")
-    await stormrush_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Stormrush",
+        lambda pctx, channel: stormrush_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="scarletsands")
 async def scarletsands_cmd(ctx):
     await ctx.send("Checking Scarlet Sands for bonus...")
-    await scarletsands_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Scarlet Sands",
+        lambda pctx, channel: scarletsands_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="playtana")
 async def playtana_cmd(ctx):
     await ctx.send("Checking Playtana for bonus...")
-    await playtana_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Playtana",
+        lambda pctx, channel: playtana_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="chipnwin")
 async def chipnwin_cmd(ctx):
     await ctx.send("Checking Chipnwin for bonus...")
-    await chipnwin_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Chipnwin",
+        lambda pctx, channel: chipnwin_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="crowncoins")
 async def crowncoins_cmd(ctx):
     await ctx.send("Checking Crown Coins Casino for bonus…")
-    await crowncoins_casino(driver, bot, ctx, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Crown Coins",
+        lambda pctx, channel: crowncoins_casino(driver, _bot(), pctx, channel),
+    )
 
 
 @bot.command(name="americanluck", aliases=["aluck", "a-luck", "american luck"])
 async def americanluck_cmd(ctx):
     await ctx.send("Checking American Luck for bonus…")
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    await americanluck_uc(ctx, channel)
+    await _run_manual_casino_command(
+        ctx,
+        "American Luck",
+        lambda pctx, channel: americanluck_uc(pctx, channel),
+    )
 
 
 @bot.command(
@@ -2577,8 +3122,11 @@ async def americanluck_cmd(ctx):
     ],
 )
 async def luckparty_cmd(ctx):
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    await _call_luckparty(channel=channel, ctx=ctx, raise_errors=False)
+    await _run_manual_casino_command(
+        ctx,
+        "Luck Party",
+        lambda pctx, channel: _call_luckparty(channel=channel, ctx=pctx, raise_errors=False),
+    )
 
 
 @bot.command(
@@ -2591,94 +3139,89 @@ async def luckparty_cmd(ctx):
     ],
 )
 async def winbonanza_cmd(ctx):
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    await _call_winbonanza(channel=channel, ctx=ctx, raise_errors=False)
+    await _run_manual_casino_command(
+        ctx,
+        "WinBonanza",
+        lambda pctx, channel: _call_winbonanza(channel=channel, ctx=pctx, raise_errors=False),
+    )
 
 
 @bot.command(name="modo")
 async def modo_cmd(ctx):
     await ctx.send("Checking Modo for bonus…")
-    channel = bot.get_channel(DISCORD_CHANNEL)
-
-    ok = await claim_modo_bonus(driver, bot, ctx, channel)
-
-    if not ok:
-        await check_modo_countdown(driver, bot, ctx, channel)
+    await _run_manual_casino_command(ctx, "Modo", _manual_modo_flow)
 
 
 @bot.command(name="rollingriches", aliases=["rr", "rolling riches"])
 async def rollingriches_cmd(ctx):
     await ctx.send("Checking Rolling Riches for bonus…")
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    await rolling_riches_casino(ctx, driver, channel)
+    await _run_manual_casino_command(
+        ctx,
+        "Rolling Riches",
+        lambda pctx, channel: rolling_riches_casino(pctx, driver, channel),
+    )
 
 
 @bot.command(name="luckyland", aliases=["lucky land"])
 async def luckyland_cmd(ctx):
     await ctx.send("Checking LuckyLand for bonus…")
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    await luckyland_uc(ctx, channel)
+    await _run_manual_casino_command(
+        ctx,
+        "LuckyLand",
+        lambda pctx, channel: luckyland_uc(pctx, channel),
+    )
 
 
 @bot.command(name="stake")
 async def stake_cmd(ctx):
     await ctx.send("Checking Stake for bonus…")
-    await stake_claim(driver, bot, ctx, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "Stake",
+        lambda pctx, channel: stake_claim(driver, _bot(), pctx, channel),
+    )
 
 
 @bot.command(name="fortunewheelz", aliases=["fortune wheelz", "fortune-wheelz", "fzw"])
 async def fortunewheelz_cmd(ctx):
     await ctx.send("Checking Fortune Wheelz for bonus…")
-    await _call_fortunewheelz(channel=bot.get_channel(DISCORD_CHANNEL), ctx=ctx, raise_errors=False)
+    await _run_manual_casino_command(
+        ctx,
+        "Fortune Wheelz",
+        lambda pctx, channel: _call_fortunewheelz(channel=channel, ctx=pctx, raise_errors=False),
+    )
 
 
 @bot.command(name="fortunewins", aliases=["fortune wins", "fw", "fortune coins", "fc", "fortunecoins"])
 async def fortunecoins_cmd(ctx):
     await ctx.send("Checking Fortune Wins for bonus…")
-
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    loop = asyncio.get_running_loop()
-
-    from fortunecoinsAPI import fortunecoins_uc_blocking
-
-    _exec_job_started()
-    try:
-        await loop.run_in_executor(_executor, fortunecoins_uc_blocking, bot, channel.id, loop)
-    finally:
-        _exec_job_finished()
+    await _run_manual_casino_command(ctx, "Fortune Coins/Wins", _manual_fortunecoins_flow)
 
 
 @bot.command(name="spinquest")
 async def spinquest_cmd(ctx):
     await ctx.send("Checking SpinQuest for bonus…")
-    await spinquest_flow(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "SpinQuest",
+        lambda pctx, channel: spinquest_flow(pctx, driver, channel),
+    )
 
 
 @bot.command(name="spinpals")
 async def spinpals_cmd(ctx):
     await ctx.send("Checking SpinPals for bonus…")
-    await spinpals_flow(ctx, driver, bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(
+        ctx,
+        "SpinPals",
+        lambda pctx, channel: spinpals_flow(pctx, driver, channel),
+    )
 
 
 @bot.command(name="chumba")
 async def chumba_cmd(ctx):
     await ctx.send("Checking Chumba for bonus…")
-
-    driver.get("https://lobby.chumbacasino.com/")
-    await asyncio.sleep(5)
-
-    if driver.current_url.startswith("https://login.chumbacasino.com/"):
-        authenticated = await authenticate_chumba(driver, bot, ctx)
-
-        if not authenticated:
-            await ctx.send("Chumba authentication failed.")
-            return
-
-    if driver.current_url.startswith("https://lobby.chumbacasino.com/"):
-        await claim_chumba_bonus(driver, ctx)
-        await check_chumba_countdown(driver, ctx)
-    else:
-        await ctx.send("Failed to reach the Chumba lobby.")
+    await _run_manual_casino_command(ctx, "Chumba", _manual_chumba_flow)
 
 
 @bot.command(name="chanced")
@@ -2693,18 +3236,17 @@ async def chanced_cmd(ctx):
     else:
         pair = (None, None)
 
-    await chanced_casino(ctx, driver, bot.get_channel(DISCORD_CHANNEL), pair)
+    await _run_manual_casino_command(
+        ctx,
+        "Chanced",
+        lambda pctx, channel: chanced_casino(pctx, driver, channel, pair),
+    )
 
 
 @bot.command(name="dingdingding")
 async def dingdingding_cmd(ctx):
     await ctx.send("Checking DingDingDing for bonus…")
-
-    channel = bot.get_channel(DISCORD_CHANNEL)
-    claimed = await claim_dingdingding_bonus(driver, bot, ctx, channel)
-
-    if not claimed:
-        await check_dingdingding_countdown(driver, bot, ctx, channel)
+    await _run_manual_casino_command(ctx, "DingDingDing", _manual_dingdingding_flow)
 
 
 # ───────────────────────────────────────────────────────────
@@ -2718,18 +3260,7 @@ def _runner_to_coro(runner_func: Callable[[], Any]):
     return _wrapped()
 
 
-@bot.command(name="debug")
-async def debug_cmd(ctx, *, casino: str):
-    key = normalize_casino_key(casino)
-
-    if not key:
-        await ctx.send("Usage: `!debug <casino>` example: `!debug spinquest`")
-        return
-
-    key = CASINO_ALIAS_MAP.get(key, key)
-
-    channel = bot.get_channel(DISCORD_CHANNEL)
-
+async def _debug_worker_flow(ctx, channel, key: str):
     runners = {
         "realprize": lambda: realprize_casino(ctx, driver, channel),
         "zula": lambda: zula_uc(ctx, channel),
@@ -2749,101 +3280,186 @@ async def debug_cmd(ctx, *, casino: str):
         "stormrush": lambda: stormrush_casino(ctx, driver, channel),
         "scarletsands": lambda: scarletsands_casino(ctx, driver, channel),
         "playtana": lambda: playtana_casino(ctx, driver, channel),
-        "crowncoins": lambda: crowncoins_casino(driver, bot, ctx, channel),
+        "crowncoins": lambda: crowncoins_casino(driver, _bot(), ctx, channel),
         "americanluck": lambda: americanluck_uc(ctx, channel),
         "rollingriches": lambda: rolling_riches_casino(ctx, driver, channel),
         "luckyland": lambda: luckyland_uc(ctx, channel),
-        "stake": lambda: stake_claim(driver, bot, ctx, channel),
+        "stake": lambda: stake_claim(driver, _bot(), ctx, channel),
         "fortunewheelz": lambda: _call_fortunewheelz(channel=channel, ctx=ctx, raise_errors=True),
         "spinquest": lambda: spinquest_flow(ctx, driver, channel),
         "spinpals": lambda: spinpals_flow(ctx, driver, channel),
-        "chumba": lambda: chumba_cmd(ctx),
-        "chanced": lambda: chanced_cmd(ctx),
-        "dingdingding": lambda: dingdingding_cmd(ctx),
-
-        # Custom wrappers.
+        "chumba": lambda: _manual_chumba_flow(ctx, channel),
+        "chanced": lambda: chanced_casino(ctx, driver, channel, (None, None)),
+        "dingdingding": lambda: _manual_dingdingding_flow(ctx, channel),
+        "modo": lambda: _manual_modo_flow(ctx, channel),
         "luckparty": lambda: _call_luckparty(channel=channel, ctx=ctx, raise_errors=True),
         "winbonanza": lambda: _call_winbonanza(channel=channel, ctx=ctx, raise_errors=True),
     }
 
-    if key == "modo":
-        async def _modo_flow():
-            ok = await claim_modo_bonus(driver, bot, ctx, channel)
-            if not ok:
-                await check_modo_countdown(driver, bot, ctx, channel)
-
-        target_coro = _modo_flow()
-
-    elif key in runners:
-        target_coro = _runner_to_coro(runners[key])
-
-    else:
+    if key not in runners:
         await ctx.send(
-            f"❌ Unknown casino `{casino}`.\n"
-            "Try one of: " + ", ".join(sorted(list(runners.keys()) + ["modo"]))
+            f"❌ Unknown casino `{key}`.\n"
+            "Try one of: " + ", ".join(sorted(runners.keys()))
         )
         return
 
-    await ctx.send(f"🧪 Debugging `{key}` — sending periodic screenshots while it runs…")
+    target_coro = _runner_to_coro(runners[key])
+
+    await ctx.send(f"🧪 Debugging `{key}` — periodic screenshots run inside the Selenium worker…")
 
     interval = int(os.getenv("DEBUG_SCREENSHOT_INTERVAL", "4"))
     max_shots = int(os.getenv("DEBUG_SCREENSHOT_MAX", "40"))
 
-    try:
-        await run_with_periodic_screenshots(
-            channel=ctx.channel,
-            driver=driver,
-            casino_key=key,
-            coro=target_coro,
-            interval_seconds=interval,
-            max_shots=max_shots,
-            label="debug",
-        )
+    await run_with_periodic_screenshots(
+        channel=ctx.channel,
+        driver=driver,
+        casino_key=key,
+        coro=target_coro,
+        interval_seconds=interval,
+        max_shots=max_shots,
+        label="debug",
+    )
 
-        await ctx.send(f"✅ Debug finished for `{key}`.")
+    await ctx.send(f"✅ Debug finished for `{key}`.")
 
-    except Exception as e:
-        await ctx.send(f"⚠️ Debug error for `{key}`: `{type(e).__name__}: {e}`")
+
+@bot.command(name="debug")
+async def debug_cmd(ctx, *, casino: str):
+    key = normalize_casino_key(casino)
+
+    if not key:
+        await ctx.send("Usage: `!debug <casino>` example: `!debug spinquest`")
+        return
+
+    key = CASINO_ALIAS_MAP.get(key, key)
+    await _run_manual_casino_command(
+        ctx,
+        f"debug:{key}",
+        lambda pctx, channel: _debug_worker_flow(pctx, channel, key),
+    )
 
 
 # ───────────────────────────────────────────────────────────
 # Auth router
+# Auth flows also touch Selenium, so they use the same worker lane.
 # ───────────────────────────────────────────────────────────
+async def _auth_google_flow(ctx, channel):
+    google_credentials = os.getenv("GOOGLE_LOGIN")
+
+    if google_credentials:
+        u, p = google_credentials.split(":", 1)
+        creds = (u, p)
+    else:
+        await ctx.send("🔐 Google credentials not found in `.env` `GOOGLE_LOGIN`.")
+        creds = (None, None)
+
+    try:
+        await google_auth(ctx, driver, channel, creds)
+    except Exception as e:
+        snap = "google_auth_failed.png"
+        try:
+            driver.save_screenshot(snap)
+            await ctx.send(f"Google auth error: `{e}`", file=discord.File(snap))
+        finally:
+            try:
+                os.remove(snap)
+            except Exception:
+                pass
+        raise
+
+
+async def _auth_modo_flow(ctx, channel):
+    await run_modo_auth(channel)
+
+
+async def _auth_crowncoins_flow(ctx, channel, method: str):
+    if method.lower() == "google":
+        await ctx.send("Authenticating CrownCoins via Google…")
+        ok = await auth_crown_google(driver, _bot(), ctx, channel)
+    elif method.lower() == "env":
+        await ctx.send("Authenticating CrownCoins via .env credentials…")
+        ok = await auth_crown_env(driver, _bot(), ctx, channel)
+    else:
+        await ctx.send("Invalid method. Use `google` or `env`.")
+        return
+
+    if not ok:
+        snap = f"crowncoins_{method.lower()}_auth_failed.png"
+        try:
+            driver.save_screenshot(snap)
+            await ctx.send("CrownCoins authentication failed.", file=discord.File(snap))
+        finally:
+            try:
+                os.remove(snap)
+            except Exception:
+                pass
+
+
+async def _auth_dingdingding_flow(ctx, channel):
+    ok = await authenticate_dingdingding(driver, _bot(), ctx, channel)
+
+    if not ok:
+        snap = "dingdingding_auth_failed.png"
+        try:
+            driver.save_screenshot(snap)
+            await ctx.send("Authentication failed.", file=discord.File(snap))
+        finally:
+            try:
+                os.remove(snap)
+            except Exception:
+                pass
+
+
+async def _auth_stake_flow(ctx, channel):
+    ok = await stake_auth(driver, _bot(), ctx, channel)
+
+    if not ok:
+        snap = "stake_auth_failed.png"
+        try:
+            driver.save_screenshot(snap)
+            await ctx.send("Stake authentication failed.", file=discord.File(snap))
+        finally:
+            try:
+                os.remove(snap)
+            except Exception:
+                pass
+
+
+async def _auth_nolimit_flow(ctx, channel, method: str):
+    if method.lower() == "google":
+        await ctx.send("Authenticating NoLimitCoins via Google…")
+        ok = await auth_nolimit_google(driver, channel, ctx)
+    elif method.lower() == "env":
+        await ctx.send("Authenticating NoLimitCoins via .env credentials…")
+        ok = await auth_nolimit_env(driver, channel, ctx)
+    else:
+        await ctx.send("Invalid method. Use `google` or `env`.")
+        return
+
+    if not ok:
+        snap = f"nolimit_{method.lower()}_auth_failed.png"
+        try:
+            driver.save_screenshot(snap)
+            await ctx.send("NoLimitCoins authentication failed.", file=discord.File(snap))
+        finally:
+            try:
+                os.remove(snap)
+            except Exception:
+                pass
+
+
 @bot.command(name="auth")
 async def authenticate_command(ctx: commands.Context, site: str, method: str = None):
-    channel = bot.get_channel(DISCORD_CHANNEL)
     norm_site = re.sub(r"\s+", "", site.lower())
 
     if norm_site == "google":
         await ctx.send("Authenticating Google Account…")
-
-        google_credentials = os.getenv("GOOGLE_LOGIN")
-
-        if google_credentials:
-            u, p = google_credentials.split(":", 1)
-            creds = (u, p)
-        else:
-            await ctx.send("🔐 Google credentials not found in `.env` `GOOGLE_LOGIN`.")
-            creds = (None, None)
-
-        try:
-            await google_auth(ctx, driver, channel, creds)
-        except Exception as e:
-            snap = "google_auth_failed.png"
-            try:
-                driver.save_screenshot(snap)
-                await ctx.send(f"Google auth error: `{e}`", file=discord.File(snap))
-            finally:
-                try:
-                    os.remove(snap)
-                except Exception:
-                    pass
-
+        await _run_manual_casino_command(ctx, "auth:google", _auth_google_flow)
         return
 
     if norm_site == "modo":
         await ctx.send("Authenticating Modo…")
-        await run_modo_auth(channel)
+        await _run_manual_casino_command(ctx, "auth:modo", _auth_modo_flow)
         return
 
     if norm_site == "crowncoins":
@@ -2851,63 +3467,21 @@ async def authenticate_command(ctx: commands.Context, site: str, method: str = N
             await ctx.send("Usage: `!auth crowncoins google` or `!auth crowncoins env`")
             return
 
-        if method.lower() == "google":
-            await ctx.send("Authenticating CrownCoins via Google…")
-            ok = await auth_crown_google(driver, bot, ctx, channel)
-        elif method.lower() == "env":
-            await ctx.send("Authenticating CrownCoins via .env credentials…")
-            ok = await auth_crown_env(driver, bot, ctx, channel)
-        else:
-            await ctx.send("Invalid method. Use `google` or `env`.")
-            return
-
-        if not ok:
-            snap = f"crowncoins_{method.lower()}_auth_failed.png"
-            try:
-                driver.save_screenshot(snap)
-                await ctx.send("CrownCoins authentication failed.", file=discord.File(snap))
-            finally:
-                try:
-                    os.remove(snap)
-                except Exception:
-                    pass
-
+        await _run_manual_casino_command(
+            ctx,
+            f"auth:crowncoins:{method.lower()}",
+            lambda pctx, channel: _auth_crowncoins_flow(pctx, channel, method),
+        )
         return
 
     if norm_site == "dingdingding":
         await ctx.send("Authenticating DingDingDing…")
-
-        ok = await authenticate_dingdingding(driver, bot, ctx, channel)
-
-        if not ok:
-            snap = "dingdingding_auth_failed.png"
-            try:
-                driver.save_screenshot(snap)
-                await ctx.send("Authentication failed.", file=discord.File(snap))
-            finally:
-                try:
-                    os.remove(snap)
-                except Exception:
-                    pass
-
+        await _run_manual_casino_command(ctx, "auth:dingdingding", _auth_dingdingding_flow)
         return
 
     if norm_site == "stake":
         await ctx.send("Authenticating Stake…")
-
-        ok = await stake_auth(driver, bot, ctx, channel)
-
-        if not ok:
-            snap = "stake_auth_failed.png"
-            try:
-                driver.save_screenshot(snap)
-                await ctx.send("Stake authentication failed.", file=discord.File(snap))
-            finally:
-                try:
-                    os.remove(snap)
-                except Exception:
-                    pass
-
+        await _run_manual_casino_command(ctx, "auth:stake", _auth_stake_flow)
         return
 
     if norm_site in {"nolimitcoins", "nlc", "nolimit", "no limit coins"}:
@@ -2915,27 +3489,11 @@ async def authenticate_command(ctx: commands.Context, site: str, method: str = N
             await ctx.send("Usage: `!auth nolimitcoins google` or `!auth nolimitcoins env`")
             return
 
-        if method.lower() == "google":
-            await ctx.send("Authenticating NoLimitCoins via Google…")
-            ok = await auth_nolimit_google(driver, channel, ctx)
-        elif method.lower() == "env":
-            await ctx.send("Authenticating NoLimitCoins via .env credentials…")
-            ok = await auth_nolimit_env(driver, channel, ctx)
-        else:
-            await ctx.send("Invalid method. Use `google` or `env`.")
-            return
-
-        if not ok:
-            snap = f"nolimit_{method.lower()}_auth_failed.png"
-            try:
-                driver.save_screenshot(snap)
-                await ctx.send("NoLimitCoins authentication failed.", file=discord.File(snap))
-            finally:
-                try:
-                    os.remove(snap)
-                except Exception:
-                    pass
-
+        await _run_manual_casino_command(
+            ctx,
+            f"auth:nolimitcoins:{method.lower()}",
+            lambda pctx, channel: _auth_nolimit_flow(pctx, channel, method),
+        )
         return
 
     await ctx.send(
@@ -2947,7 +3505,7 @@ async def authenticate_command(ctx: commands.Context, site: str, method: str = N
 @bot.command(name="authmodo")
 async def authmodo_cmd(ctx):
     await ctx.send("Authenticating Modo…")
-    await run_modo_auth(bot.get_channel(DISCORD_CHANNEL))
+    await _run_manual_casino_command(ctx, "auth:modo", _auth_modo_flow)
 
 
 # ───────────────────────────────────────────────────────────
@@ -3007,6 +3565,7 @@ Aliases:
 
 ---------------------------------------  
 🧩 **Diagnostics:**
+!status
 !imports
 !imports luckparty
 !imports winbonanza
@@ -3027,7 +3586,7 @@ Aliases:
 
 ---------------------------------------  
 ⚙️ **General:**  
-!ping, !restart, !help, !start, !stop, !about, !reset
+!ping, !status, !restart, !help, !start, !stop, !about, !reset
 
 Examples:
 `!config disable spinquest`
@@ -3042,4 +3601,36 @@ Examples:
 # ───────────────────────────────────────────────────────────
 # Run bot
 # ───────────────────────────────────────────────────────────
-bot.run(DISCORD_TOKEN)
+def _run_bot_supervised():
+    """Start Discord with a final crash guard.
+
+    Normal command/API errors should be contained by the command wrappers above.
+    This is only the last line of defense for a fatal discord.py/client crash.
+    In Docker, `restart: unless-stopped` is still recommended.
+    """
+    try:
+        bot.run(DISCORD_TOKEN, reconnect=True)
+    except KeyboardInterrupt:
+        raise
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"[Fatal] bot.run crashed: {type(e).__name__}: {e}")
+        traceback.print_exc()
+
+        if os.getenv("BOT_SUPERVISOR_RESTART_ON_FATAL", "1").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            delay = float(os.getenv("BOT_SUPERVISOR_RESTART_DELAY_SECONDS", "8"))
+            print(f"[Fatal] Restarting Python process in {delay:g}s...")
+            time.sleep(delay)
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+
+        raise
+
+
+if __name__ == "__main__":
+    _run_bot_supervised()
