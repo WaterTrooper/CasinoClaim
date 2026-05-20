@@ -1,25 +1,35 @@
 # Drake Hooks + WaterTrooper
 # Casino Claim 3
 # Chipnwin API
-# Version 5.0
+# Version 5.2
 # Updated 2026.05.13
 #
 # Notes:
-# - Adds direct rewards page support:
+# - Fixes false "already logged in" detection.
+# - Uses direct login URL:
+#     https://chipnwin.com/#/login
+# - Uses direct rewards URL:
 #     https://chipnwin.com/store/features/#/rewards
-# - Reads Daily Rewards countdown BEFORE trying to claim.
-# - Uses a candidate system to find the current-day countdown.
+# - Adds your exact email field XPath as the first email candidate.
+# - Uses a robust candidate/scoring system for email/password fields.
+# - Uses JS/native input events if normal send_keys does not stick.
+# - Uses state-based flow:
+#     rewards open -> claim/countdown
+#     login form open -> login
+#     unknown -> try login, then rewards
+# - Reads Daily Rewards countdown if claim is unavailable.
 # - Countdown sends text only — no screenshot.
-# - Only sends "claimed" if the claim click is confirmed.
-# - Screenshots on successful claim, login timeout, or real error/no countdown candidate.
+# - Screenshots on successful claim, login failure, rewards-open failure, or no countdown/claim candidate.
 
 import re
 import os
+import time
 import asyncio
 import discord
 from dotenv import load_dotenv
 
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
@@ -39,6 +49,7 @@ load_dotenv()
 CHIPNWIN_CRED = os.getenv("CHIPNWIN")  # format "email:password"
 
 SITE_URL = "https://chipnwin.com"
+LOGIN_URL = "https://chipnwin.com/#/login"
 STORE_URL = "https://chipnwin.com/store/features"
 REWARDS_URL = "https://chipnwin.com/store/features/#/rewards"
 
@@ -47,11 +58,41 @@ COOKIE_BUTTON_XPATHS = [
     "/html/body/div[1]/div[7]/div/div[2]/button",
     "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'accept')]",
     "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'agree')]",
+    "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'got it')]",
 ]
 
-LOGIN_BUTTON_XPATH = "//span[@class='s14__w500__h22 color_ADADC2']"
-EMAIL_INPUT_XPATH = "//input[@id='input_customemail']"
-PASSWORD_INPUT_XPATH = "//input[@id='input_custompassword']"
+# Exact field XPath from your screenshot.
+EMAIL_EXACT_XPATH = "/html/body/div[1]/div[6]/div/div[2]/div[2]/div[4]/div[1]/div[2]/div[1]/input"
+
+# Best-guess absolute password fallback near the same modal structure.
+PASSWORD_EXACT_XPATHS = [
+    "/html/body/div[1]/div[6]/div/div[2]/div[2]/div[4]/div[2]/div[2]/div[1]/input",
+    "/html/body/div[1]/div[6]/div/div[2]/div[2]/div[4]/div[2]/div[2]/input",
+    "/html/body/div[1]/div[6]/div/div[2]/div[2]/div[4]/div[2]//input",
+    "/html/body/div[1]/div[7]/div/div[2]/div[2]/div[4]/div[2]//input",
+]
+
+EMAIL_FIELD_LOCATORS = [
+    (By.XPATH, EMAIL_EXACT_XPATH),
+    (By.ID, "input_customemail"),
+    (By.CSS_SELECTOR, "input#input_customemail"),
+    (By.CSS_SELECTOR, "input[type='email']"),
+    (By.XPATH, "//input[contains(translate(@placeholder, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'email')]"),
+    (By.XPATH, "//input[contains(translate(@name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'email')]"),
+    (By.XPATH, "//input[contains(translate(@id, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'email')]"),
+    (By.XPATH, "//input[contains(translate(@autocomplete, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'email')]"),
+]
+
+PASSWORD_FIELD_LOCATORS = [
+    *[(By.XPATH, xp) for xp in PASSWORD_EXACT_XPATHS],
+    (By.ID, "input_custompassword"),
+    (By.CSS_SELECTOR, "input#input_custompassword"),
+    (By.CSS_SELECTOR, "input[type='password']"),
+    (By.XPATH, "//input[contains(translate(@placeholder, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'password')]"),
+    (By.XPATH, "//input[contains(translate(@name, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'password')]"),
+    (By.XPATH, "//input[contains(translate(@id, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'password')]"),
+    (By.XPATH, "//input[contains(translate(@autocomplete, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'password')]"),
+]
 
 LOGIN_SUBMIT_XPATHS = [
     "/html/body/div[1]/div[6]/div/div[2]/div[2]/div[5]/div/button",
@@ -64,8 +105,6 @@ LOGIN_SUBMIT_XPATHS = [
 START_BUTTON_XPATHS = [
     "/html/body/div[1]/div[3]/div/div[1]/div[3]/div[2]/div[3]/div[4]/div[2]/button",
     "/html/body/div[1]/div[4]/div/div[1]/div[3]/div[2]/div[3]/div[4]/div[2]/button",
-
-    # Generic daily reward openers.
     "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'daily')]",
     "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'daily rewards')]",
     "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'daily reward')]",
@@ -75,10 +114,8 @@ CLAIM_BUTTON_XPATHS = [
     "/html/body/div[1]/div[6]/div/div[2]/div[3]/button",
     "/html/body/div[1]/div[7]/div/div[2]/div[3]/button",
     "/html/body/div[1]/div[8]/div/div[2]/div[3]/button",
-
-    # Generic modal claim buttons.
-    "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim')]",
     "//div[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'daily rewards')]//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim')]",
+    "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim')]",
 ]
 
 SPINWIN_BUTTON_XPATHS = [
@@ -91,16 +128,11 @@ SPIN_BUTTON_XPATHS = [
     "/html/body/div[1]/div[7]/div/div[3]/div/button",
 ]
 
-# Your current-day countdown XPath fallback.
 CURRENT_DAY_COUNTDOWN_XPATH = "/html/body/div[1]/div[6]/div/div[2]/div[2]/div[1]/p"
 
-# Countdown candidates.
-# Keep these focused on the Daily Rewards modal/card so it does not grab random timers.
 COUNTDOWN_CANDIDATE_LOCATORS = [
     (By.XPATH, CURRENT_DAY_COUNTDOWN_XPATH),
 
-    # Best match from your element:
-    # <p class="s14__w500__h22 ... text_align_center white_space_nowrap ...">22:56:23</p>
     (
         By.XPATH,
         "//p[contains(@class, 's14__w500__h22') "
@@ -109,14 +141,12 @@ COUNTDOWN_CANDIDATE_LOCATORS = [
         "and contains(normalize-space(.), ':')]"
     ),
 
-    # Current active daily reward card tends to be first normal daily-rewards card.
     (
         By.XPATH,
         "//div[contains(@class, 'daily-rewards__card')][1]"
         "//p[contains(normalize-space(.), ':')]"
     ),
 
-    # Modal-scoped p countdowns.
     (
         By.XPATH,
         "//div[contains(@class, 'layouts-modals-simple') "
@@ -125,14 +155,12 @@ COUNTDOWN_CANDIDATE_LOCATORS = [
         "//p[contains(normalize-space(.), ':')]"
     ),
 
-    # Daily rewards scoped fallback.
     (
         By.XPATH,
         "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'daily rewards')]"
         "/ancestor::div[1]//p[contains(normalize-space(.), ':')]"
     ),
 
-    # Last resort: visible p elements with a clean HH:MM:SS format.
     (
         By.XPATH,
         "//p[contains(normalize-space(.), ':')]"
@@ -141,56 +169,18 @@ COUNTDOWN_CANDIDATE_LOCATORS = [
 
 
 # ───────────────────────────────────────────────────────────
-# Helpers
+# Generic Helpers
 # ───────────────────────────────────────────────────────────
 
-def _is_logged_in(driver) -> bool:
-    """Detect if already logged in."""
+def _attr(el, name: str) -> str:
     try:
-        driver.find_element(
-            By.XPATH,
-            "//p[@class='s12__w500__h18 color_1BB83D line_height_normal_important']"
-        )
-        return True
-    except NoSuchElementException:
-        pass
-
-    try:
-        driver.find_element(By.XPATH, "//span[@data-test='balance']")
-        return True
-    except NoSuchElementException:
-        pass
-
-    try:
-        driver.find_element(
-            By.XPATH,
-            "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'wallet')]"
-        )
-        return True
-    except NoSuchElementException:
-        return False
+        return el.get_attribute(name) or ""
+    except Exception:
+        return ""
 
 
-def _clean_countdown(raw: str) -> str | None:
-    """
-    Accepts:
-      - 22:56:23
-      - 22 : 56 : 23
-
-    Returns:
-      - HH:MM:SS
-      - None
-    """
-    if not raw:
-        return None
-
-    match = re.search(r"(\d{1,2})\s*:\s*(\d{2})\s*:\s*(\d{2})", raw)
-
-    if not match:
-        return None
-
-    h, m, s = match.groups()
-    return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
+def _lower_attr(el, name: str) -> str:
+    return _attr(el, name).strip().lower()
 
 
 def _element_text(driver, el) -> str:
@@ -211,7 +201,7 @@ def _element_text(driver, el) -> str:
     except Exception:
         pass
 
-    return " ".join(t.strip() for t in texts if t and t.strip()).strip()
+    return " ".join(t.strip() for t in texts if t and t.strip()).replace("\xa0", " ").strip()
 
 
 def _scroll_into_view(driver, el) -> None:
@@ -243,10 +233,35 @@ def _safe_click(driver, el, label="element") -> bool:
         return False
 
 
+def _is_visible(el) -> bool:
+    try:
+        return bool(el.is_displayed())
+    except Exception:
+        return False
+
+
+def _is_enabled(el) -> bool:
+    try:
+        return bool(el.is_enabled())
+    except Exception:
+        return False
+
+
+def _element_disabled_or_not_allowed(driver, el) -> bool:
+    classes = _lower_attr(el, "class")
+
+    if "disabled" in classes or "not_allowed" in classes or "not-allowed" in classes:
+        return True
+
+    for attr in ("disabled", "aria-disabled"):
+        value = _lower_attr(el, attr)
+        if value in {"true", "1", "disabled"}:
+            return True
+
+    return False
+
+
 def _first_clickable(driver, xpaths, timeout=6):
-    """
-    Returns (xpath, element) for first clickable XPath.
-    """
     for xp in xpaths:
         try:
             el = WebDriverWait(driver, timeout).until(
@@ -261,25 +276,670 @@ def _first_clickable(driver, xpaths, timeout=6):
     return None, None
 
 
-def _element_disabled_or_not_allowed(driver, el) -> bool:
+async def _send_screenshot(channel, driver, message, filename):
     try:
-        classes = (el.get_attribute("class") or "").lower()
+        driver.save_screenshot(filename)
 
-        if "disabled" in classes or "not_allowed" in classes or "not-allowed" in classes:
-            return True
+        await channel.send(
+            message,
+            file=discord.File(filename)
+        )
+
+    except Exception as e:
+        print(f"[Chipnwin] Screenshot send failed: {e}")
+        await channel.send(message)
+
+    finally:
+        try:
+            os.remove(filename)
+        except Exception:
+            pass
+
+
+async def _send_countdown(channel, countdown: str):
+    await channel.send(f"Next Chipnwin Bonus Available in: {countdown}")
+
+
+# ───────────────────────────────────────────────────────────
+# Login Candidate System
+# ───────────────────────────────────────────────────────────
+
+def _score_input_candidate(driver, el, kind: str) -> int:
+    score = 0
+
+    if not _is_visible(el):
+        return -999
+
+    if not _is_enabled(el):
+        return -999
+
+    if _lower_attr(el, "readonly") in {"true", "readonly", "1"}:
+        return -999
+
+    try:
+        tag = (el.tag_name or "").lower()
+    except Exception:
+        tag = ""
+
+    if tag != "input":
+        return -999
+
+    typ = _lower_attr(el, "type")
+    placeholder = _lower_attr(el, "placeholder")
+    name = _lower_attr(el, "name")
+    element_id = _lower_attr(el, "id")
+    autocomplete = _lower_attr(el, "autocomplete")
+    classes = _lower_attr(el, "class")
+
+    if kind == "email":
+        if typ == "email":
+            score += 100
+        if "customemail" in element_id:
+            score += 120
+        if "email" in element_id:
+            score += 80
+        if "email" in placeholder:
+            score += 70
+        if "email" in name:
+            score += 60
+        if "email" in autocomplete or "username" in autocomplete:
+            score += 30
+        if typ in {"password", "checkbox", "hidden", "submit", "button"}:
+            score -= 300
+
+    if kind == "password":
+        if typ == "password":
+            score += 120
+        if "custompassword" in element_id:
+            score += 120
+        if "password" in element_id:
+            score += 80
+        if "password" in placeholder:
+            score += 70
+        if "password" in name:
+            score += 60
+        if "current-password" in autocomplete or "password" in autocomplete:
+            score += 30
+        if typ in {"email", "checkbox", "hidden", "submit", "button"}:
+            score -= 300
+
+    if "background_282d44" in classes:
+        score += 10
+
+    try:
+        nearby_text = driver.execute_script(
+            """
+            let e = arguments[0];
+            let out = '';
+            for (let i = 0; e && i < 5; i++, e = e.parentElement) {
+                out += ' ' + (e.innerText || '');
+            }
+            return out.toLowerCase();
+            """,
+            el
+        ) or ""
+
+        if "log in" in nearby_text or "login" in nearby_text:
+            score += 20
+
+        if kind == "email" and "email" in nearby_text:
+            score += 20
+
+        if kind == "password" and "password" in nearby_text:
+            score += 20
+
     except Exception:
         pass
 
-    for attr in ("disabled", "aria-disabled"):
-        try:
-            value = (el.get_attribute(attr) or "").strip().lower()
+    return score
 
-            if value in {"true", "1", "disabled"}:
+
+def _find_best_input(driver, kind: str):
+    locators = EMAIL_FIELD_LOCATORS if kind == "email" else PASSWORD_FIELD_LOCATORS
+
+    candidates = []
+    seen = set()
+
+    for by, value in locators:
+        try:
+            elements = driver.find_elements(by, value)
+
+            for el in elements:
+                try:
+                    remote_id = getattr(el, "id", None) or str(el)
+
+                    if remote_id in seen:
+                        continue
+
+                    seen.add(remote_id)
+
+                    score = _score_input_candidate(driver, el, kind)
+
+                    if score > 0:
+                        candidates.append((score, el))
+
+                except StaleElementReferenceException:
+                    continue
+                except Exception:
+                    continue
+
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    best_score, best = candidates[0]
+
+    print(f"[Chipnwin] Selected {kind} input candidate with score {best_score}.")
+    return best
+
+
+def _input_value(driver, el) -> str:
+    try:
+        return driver.execute_script("return arguments[0].value || '';", el) or ""
+    except Exception:
+        try:
+            return el.get_attribute("value") or ""
+        except Exception:
+            return ""
+
+
+def _set_input_value(driver, el, value: str, label: str) -> bool:
+    _scroll_into_view(driver, el)
+
+    try:
+        el.click()
+        time.sleep(0.2)
+    except Exception:
+        pass
+
+    try:
+        el.send_keys(Keys.CONTROL, "a")
+        el.send_keys(Keys.BACKSPACE)
+        el.send_keys(value)
+        time.sleep(0.4)
+
+        current = _input_value(driver, el)
+
+        if current == value:
+            print(f"[Chipnwin] Entered {label} with send_keys.")
+            return True
+
+        print(f"[Chipnwin] send_keys did not stick for {label}. Current length={len(current)}")
+
+    except Exception as e:
+        print(f"[Chipnwin] send_keys failed for {label}: {e}")
+
+    try:
+        driver.execute_script(
+            """
+            const el = arguments[0];
+            const value = arguments[1];
+
+            el.focus();
+
+            const proto = Object.getPrototypeOf(el);
+            const descriptor =
+                Object.getOwnPropertyDescriptor(proto, 'value') ||
+                Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value');
+
+            if (descriptor && descriptor.set) {
+                descriptor.set.call(el, value);
+            } else {
+                el.value = value;
+            }
+
+            el.dispatchEvent(new Event('input', { bubbles: true }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+            el.dispatchEvent(new KeyboardEvent('keydown', { bubbles: true }));
+            el.dispatchEvent(new KeyboardEvent('keyup', { bubbles: true }));
+            """,
+            el,
+            value,
+        )
+
+        time.sleep(0.5)
+        current = _input_value(driver, el)
+
+        if current == value:
+            print(f"[Chipnwin] Entered {label} with JS/native input events.")
+            return True
+
+        print(f"[Chipnwin] JS input did not stick for {label}. Current length={len(current)}")
+
+    except Exception as e:
+        print(f"[Chipnwin] JS input fallback failed for {label}: {e}")
+
+    return False
+
+
+def _find_login_submit_button(driver, password_el=None):
+    candidates = []
+    seen = set()
+
+    for xp in LOGIN_SUBMIT_XPATHS:
+        try:
+            for btn in driver.find_elements(By.XPATH, xp):
+                remote_id = getattr(btn, "id", None) or str(btn)
+
+                if remote_id in seen:
+                    continue
+
+                seen.add(remote_id)
+
+                if _is_visible(btn):
+                    candidates.append(btn)
+
+        except Exception:
+            continue
+
+    try:
+        for btn in driver.find_elements(By.XPATH, "//button"):
+            remote_id = getattr(btn, "id", None) or str(btn)
+
+            if remote_id in seen:
+                continue
+
+            seen.add(remote_id)
+
+            if _is_visible(btn):
+                candidates.append(btn)
+
+    except Exception:
+        pass
+
+    scored = []
+
+    for btn in candidates:
+        try:
+            if not _is_enabled(btn):
+                continue
+
+            if _element_disabled_or_not_allowed(driver, btn):
+                continue
+
+            score = 0
+            text = _element_text(driver, btn).lower()
+            typ = _lower_attr(btn, "type")
+            classes = _lower_attr(btn, "class")
+
+            if typ == "submit":
+                score += 40
+
+            if text in {"log in", "login", "sign in", "signin"}:
+                score += 100
+            elif "log in" in text or "login" in text or "sign in" in text:
+                score += 60
+
+            if "primary" in classes:
+                score += 10
+
+            if password_el is not None:
+                try:
+                    btn_rect = btn.rect
+                    pw_rect = password_el.rect
+
+                    # Prefer the real submit below the password input,
+                    # not the top tab button.
+                    if btn_rect.get("y", 0) > pw_rect.get("y", 0):
+                        score += 80
+                    else:
+                        score -= 60
+
+                except Exception:
+                    pass
+
+            try:
+                nearby_text = driver.execute_script(
+                    """
+                    let e = arguments[0];
+                    let out = '';
+                    for (let i = 0; e && i < 5; i++, e = e.parentElement) {
+                        out += ' ' + (e.innerText || '');
+                    }
+                    return out.toLowerCase();
+                    """,
+                    btn
+                ) or ""
+
+                if "forgot your password" in nearby_text:
+                    score += 40
+
+                if "email" in nearby_text and "password" in nearby_text:
+                    score += 40
+
+                if "sign up" in nearby_text and "forgot" not in nearby_text:
+                    score -= 20
+
+            except Exception:
+                pass
+
+            if score > 0:
+                scored.append((score, btn, text))
+
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            continue
+
+    if not scored:
+        return None
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_btn, best_text = scored[0]
+    print(f"[Chipnwin] Selected login submit candidate score={best_score}, text={best_text!r}.")
+    return best_btn
+
+
+# ───────────────────────────────────────────────────────────
+# State Detection
+# ───────────────────────────────────────────────────────────
+
+def _login_form_present(driver) -> bool:
+    try:
+        url = (driver.current_url or "").lower()
+        if "#/login" in url:
+            email = _find_best_input(driver, "email")
+            password = _find_best_input(driver, "password")
+            if email or password:
                 return True
+    except Exception:
+        pass
+
+    email = _find_best_input(driver, "email")
+    password = _find_best_input(driver, "password")
+
+    return bool(email and password)
+
+
+def _daily_rewards_modal_open(driver) -> bool:
+    """
+    This must be strict.
+    Do NOT treat the login artwork text like "Daily to get free rewards" as the rewards modal.
+    """
+    strict_checks = [
+        "//*[normalize-space()='Daily Rewards' or normalize-space()='DAILY REWARDS']",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in daily to claim prizes')]",
+        "//div[contains(@class, 'daily-rewards__card')]",
+    ]
+
+    for xp in strict_checks:
+        try:
+            elements = driver.find_elements(By.XPATH, xp)
+
+            for el in elements:
+                if _is_visible(el):
+                    return True
+
+        except Exception:
+            continue
+
+    # Claim button alone is not enough unless nearby text says Daily Rewards.
+    try:
+        buttons = driver.find_elements(
+            By.XPATH,
+            "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim')]"
+        )
+
+        for btn in buttons:
+            if not _is_visible(btn):
+                continue
+
+            nearby_text = driver.execute_script(
+                """
+                let e = arguments[0];
+                let out = '';
+                for (let i = 0; e && i < 6; i++, e = e.parentElement) {
+                    out += ' ' + (e.innerText || '');
+                }
+                return out.toLowerCase();
+                """,
+                btn
+            ) or ""
+
+            if "daily rewards" in nearby_text or "log in daily to claim prizes" in nearby_text:
+                return True
+
+    except Exception:
+        pass
+
+    return False
+
+
+def _is_logged_in(driver) -> bool:
+    """
+    Strong logged-in check only.
+
+    This intentionally does NOT use broad text like 'store' or 'wallet'
+    because those caused false positives when the login modal/page was open.
+    """
+    try:
+        url = (driver.current_url or "").lower()
+
+        if "#/login" in url:
+            return False
+    except Exception:
+        pass
+
+    if _login_form_present(driver):
+        return False
+
+    strong_checks = [
+        "//span[@data-test='balance']",
+        "//*[contains(@class, 'balance') and contains(normalize-space(.), '.')]",
+        "//*[contains(@class, 'balance') and contains(normalize-space(.), '$')]",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'logout')]",
+        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log out')]",
+    ]
+
+    for xp in strong_checks:
+        try:
+            elements = driver.find_elements(By.XPATH, xp)
+
+            for el in elements:
+                if _is_visible(el):
+                    text = _element_text(driver, el)
+
+                    # Balance can be icon-only or text-based. Visibility is enough
+                    # for data-test='balance', but not for random broad xpaths.
+                    if "@data-test='balance'" in xp:
+                        return True
+
+                    if text:
+                        return True
+
+        except Exception:
+            continue
+
+    return False
+
+
+def _get_page_state(driver) -> str:
+    if _daily_rewards_modal_open(driver):
+        return "daily_rewards"
+
+    if _login_form_present(driver):
+        return "login"
+
+    if _is_logged_in(driver):
+        return "logged_in"
+
+    try:
+        url = (driver.current_url or "").lower()
+
+        if "#/login" in url:
+            return "login"
+
+        if "store/features" in url:
+            return "store"
+
+    except Exception:
+        pass
+
+    return "unknown"
+
+
+# ───────────────────────────────────────────────────────────
+# Login Flow Helpers
+# ───────────────────────────────────────────────────────────
+
+async def _accept_cookies(driver):
+    print("[Chipnwin] Attempting to accept cookie...")
+    for cb in COOKIE_BUTTON_XPATHS:
+        try:
+            cookie = WebDriverWait(driver, 3).until(
+                EC.element_to_be_clickable((By.XPATH, cb))
+            )
+
+            if _safe_click(driver, cookie, "cookie button"):
+                await asyncio.sleep(2)
+                return True
+
+        except TimeoutException:
+            pass
         except Exception:
             pass
 
     return False
+
+
+async def _wait_for_login_form(driver, timeout=15):
+    end = time.time() + timeout
+
+    while time.time() < end:
+        email = _find_best_input(driver, "email")
+        password = _find_best_input(driver, "password")
+
+        if email and password:
+            return email, password
+
+        await asyncio.sleep(1)
+
+    return None, None
+
+
+async def _wait_for_logged_in_or_rewards(driver, timeout=18) -> bool:
+    end = time.time() + timeout
+
+    while time.time() < end:
+        if _daily_rewards_modal_open(driver):
+            return True
+
+        if _is_logged_in(driver):
+            return True
+
+        await asyncio.sleep(1)
+
+    return False
+
+
+async def _login_chipnwin(ctx, driver, channel, username: str, password: str) -> bool:
+    print("[Chipnwin] Navigating directly to login URL...")
+    driver.get(LOGIN_URL)
+    await asyncio.sleep(6)
+
+    await _accept_cookies(driver)
+
+    if _daily_rewards_modal_open(driver) or _is_logged_in(driver):
+        print("[Chipnwin] Already authenticated after loading login URL.")
+        return True
+
+    print(f"[Chipnwin] Page state before locating login fields: {_get_page_state(driver)}")
+
+    email_el, password_el = await _wait_for_login_form(driver, timeout=15)
+
+    if not email_el or not password_el:
+        await _send_screenshot(
+            channel,
+            driver,
+            "[Chipnwin] Login page opened, but email/password fields were not found.",
+            "chipnwin_login_fields_not_found.png"
+        )
+        return False
+
+    email_ok = _set_input_value(driver, email_el, username, "email")
+    password_ok = _set_input_value(driver, password_el, password, "password")
+
+    if not email_ok or not password_ok:
+        await _send_screenshot(
+            channel,
+            driver,
+            "[Chipnwin] Could not enter email/password into login form.",
+            "chipnwin_login_input_failed.png"
+        )
+        return False
+
+    await asyncio.sleep(1)
+
+    submit_btn = _find_login_submit_button(driver, password_el=password_el)
+
+    submitted = False
+
+    if submit_btn:
+        submitted = _safe_click(driver, submit_btn, "login submit button")
+        await asyncio.sleep(8)
+
+    if not submitted:
+        print("[Chipnwin] Submit button click failed. Trying Enter on password field.")
+        try:
+            password_el.send_keys(Keys.ENTER)
+            submitted = True
+            await asyncio.sleep(8)
+        except Exception:
+            submitted = False
+
+    if not submitted:
+        await _send_screenshot(
+            channel,
+            driver,
+            "[Chipnwin] Could not submit login form.",
+            "chipnwin_login_submit_failed.png"
+        )
+        return False
+
+    if await _wait_for_logged_in_or_rewards(driver, timeout=18):
+        print("[Chipnwin] Login confirmed.")
+        return True
+
+    print("[Chipnwin] Login not confirmed yet. Probing rewards URL once.")
+    try:
+        driver.get(REWARDS_URL)
+        await asyncio.sleep(8)
+    except Exception:
+        pass
+
+    if _daily_rewards_modal_open(driver) or _is_logged_in(driver):
+        print("[Chipnwin] Login confirmed after rewards probe.")
+        return True
+
+    await _send_screenshot(
+        channel,
+        driver,
+        "[Chipnwin] Login submitted, but logged-in/rewards state was not confirmed.",
+        "chipnwin_login_not_confirmed.png"
+    )
+    return False
+
+
+# ───────────────────────────────────────────────────────────
+# Countdown Helpers
+# ───────────────────────────────────────────────────────────
+
+def _clean_countdown(raw: str) -> str | None:
+    if not raw:
+        return None
+
+    raw = raw.replace("\xa0", " ")
+
+    match = re.search(r"(\d{1,2})\s*:\s*(\d{2})\s*:\s*(\d{2})", raw)
+
+    if not match:
+        return None
+
+    h, m, s = match.groups()
+    return f"{int(h):02d}:{int(m):02d}:{int(s):02d}"
 
 
 def _score_countdown_candidate(driver, el, text: str) -> int:
@@ -292,21 +952,18 @@ def _score_countdown_candidate(driver, el, text: str) -> int:
     except Exception:
         pass
 
-    try:
-        classes = (el.get_attribute("class") or "").lower()
+    classes = _lower_attr(el, "class")
 
-        if "s14__w500__h22" in classes:
-            score += 30
-        if "text_align_center" in classes:
-            score += 20
-        if "white_space_nowrap" in classes:
-            score += 20
-        if "background_914bfa" in classes:
-            score += 20
-        if "daily-rewards" in classes:
-            score += 15
-    except Exception:
-        pass
+    if "s14__w500__h22" in classes:
+        score += 30
+    if "text_align_center" in classes:
+        score += 20
+    if "white_space_nowrap" in classes:
+        score += 20
+    if "background_914bfa" in classes:
+        score += 20
+    if "daily-rewards" in classes:
+        score += 15
 
     try:
         nearby_text = driver.execute_script(
@@ -331,10 +988,10 @@ def _score_countdown_candidate(driver, el, text: str) -> int:
             score += 15
         if "spin" in nearby_lower or "wheel" in nearby_lower:
             score -= 15
+
     except Exception:
         pass
 
-    # Clean HH:MM:SS text is better than a big blob of text.
     if re.fullmatch(r"\s*\d{1,2}\s*:\s*\d{2}\s*:\s*\d{2}\s*", text or ""):
         score += 40
     elif _clean_countdown(text):
@@ -344,18 +1001,8 @@ def _score_countdown_candidate(driver, el, text: str) -> int:
 
 
 def _read_countdown(driver, timeout=8) -> str | None:
-    """
-    Candidate-system countdown reader.
-
-    This searches for likely Daily Rewards countdown elements, scores them,
-    and returns the best HH:MM:SS candidate.
-    """
-    end_time = asyncio.get_event_loop().time() + timeout if asyncio.get_event_loop().is_running() else None
-
     candidates = []
     seen = set()
-
-    # Do a few short passes because the modal often animates in.
     passes = max(1, int(timeout / 2))
 
     for _ in range(passes):
@@ -372,7 +1019,7 @@ def _read_countdown(driver, timeout=8) -> str | None:
 
                         seen.add(remote_id)
 
-                        if not el.is_displayed():
+                        if not _is_visible(el):
                             continue
 
                         text = _element_text(driver, el)
@@ -395,92 +1042,45 @@ def _read_countdown(driver, timeout=8) -> str | None:
         if candidates:
             candidates.sort(key=lambda x: x[0], reverse=True)
             best_score, best_countdown, best_text = candidates[0]
+
             print(
                 f"[Chipnwin] Countdown candidate selected: {best_countdown} "
                 f"(score={best_score}, text={best_text!r})"
             )
+
             return best_countdown
 
-        try:
-            import time
-            time.sleep(2)
-        except Exception:
-            break
-
-        if end_time and asyncio.get_event_loop().time() >= end_time:
-            break
+        time.sleep(2)
 
     return None
 
 
-async def _send_countdown(channel, countdown: str):
-    await channel.send(f"Next Chipnwin Bonus Available in: {countdown}")
-
-
-async def _send_screenshot(channel, driver, message, filename):
-    try:
-        driver.save_screenshot(filename)
-
-        await channel.send(
-            message,
-            file=discord.File(filename)
-        )
-
-    except Exception as e:
-        print(f"[Chipnwin] Screenshot send failed: {e}")
-        await channel.send(message)
-
-    finally:
-        try:
-            os.remove(filename)
-        except Exception:
-            pass
-
-
-def _daily_rewards_modal_open(driver) -> bool:
-    checks = [
-        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'daily rewards')]",
-        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in daily to claim prizes')]",
-        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim')]",
-    ]
-
-    for xp in checks:
-        try:
-            elements = driver.find_elements(By.XPATH, xp)
-
-            for el in elements:
-                try:
-                    if el.is_displayed():
-                        return True
-                except Exception:
-                    continue
-
-        except Exception:
-            continue
-
-    return False
-
+# ───────────────────────────────────────────────────────────
+# Rewards Flow
+# ───────────────────────────────────────────────────────────
 
 async def _open_daily_rewards(driver):
-    """
-    Opens the Daily Rewards modal/page.
-
-    First tries the direct hash route:
-      /store/features/#/rewards
-
-    If the modal does not open, falls back to clicking Daily Rewards card.
-    """
     print("[Chipnwin] Navigating directly to rewards page...")
     driver.get(REWARDS_URL)
-    await asyncio.sleep(6)
+    await asyncio.sleep(8)
 
     if _daily_rewards_modal_open(driver):
         print("[Chipnwin] Daily Rewards modal/page opened from direct link.")
         return True
 
+    state = _get_page_state(driver)
+    print(f"[Chipnwin] State after rewards URL: {state}")
+
+    if state == "login":
+        return False
+
     print("[Chipnwin] Direct rewards route did not open modal. Trying store card...")
     driver.get(STORE_URL)
-    await asyncio.sleep(5)
+    await asyncio.sleep(6)
+
+    if _login_form_present(driver):
+        print("[Chipnwin] Login form appeared while trying store.")
+        return False
 
     _, start_btn = _first_clickable(driver, START_BUTTON_XPATHS, timeout=8)
 
@@ -496,13 +1096,32 @@ async def _open_daily_rewards(driver):
     return False
 
 
-def _confirm_claim_succeeded(driver, clicked_element, timeout=8) -> bool:
-    """
-    Only announce claimed if we see a real post-click success state.
+def _find_claim_button(driver, timeout=8):
+    for xp in CLAIM_BUTTON_XPATHS:
+        try:
+            btn = WebDriverWait(driver, timeout).until(
+                EC.presence_of_element_located((By.XPATH, xp))
+            )
 
-    Removed the old broad "reward" success check because the Daily Rewards modal
-    itself always contains that word and caused false positives.
-    """
+            if not _is_visible(btn):
+                continue
+
+            text = _element_text(driver, btn).lower()
+
+            if "claim" not in text:
+                continue
+
+            return xp, btn
+
+        except TimeoutException:
+            continue
+        except Exception:
+            continue
+
+    return None, None
+
+
+def _confirm_claim_succeeded(driver, clicked_element, timeout=8) -> bool:
     try:
         WebDriverWait(driver, timeout).until(EC.staleness_of(clicked_element))
         return True
@@ -525,11 +1144,13 @@ def _confirm_claim_succeeded(driver, clicked_element, timeout=8) -> bool:
                     return True
 
                 return False
+
             except Exception:
                 return False
 
         if WebDriverWait(driver, timeout).until(_btn_changed):
             return True
+
     except TimeoutException:
         pass
     except Exception:
@@ -547,11 +1168,8 @@ def _confirm_claim_succeeded(driver, clicked_element, timeout=8) -> bool:
             elements = driver.find_elements(By.XPATH, xp)
 
             for el in elements:
-                try:
-                    if el.is_displayed():
-                        return True
-                except Exception:
-                    continue
+                if _is_visible(el):
+                    return True
 
         except Exception:
             continue
@@ -560,7 +1178,7 @@ def _confirm_claim_succeeded(driver, clicked_element, timeout=8) -> bool:
 
 
 # ───────────────────────────────────────────────────────────
-# 1) Login Flow
+# Main Casino Flow
 # ───────────────────────────────────────────────────────────
 
 async def chipnwin_casino(ctx, driver, channel):
@@ -570,110 +1188,55 @@ async def chipnwin_casino(ctx, driver, channel):
 
     username, password = CHIPNWIN_CRED.split(":", 1)
 
-    print("[Chipnwin] Navigating to site...")
-    driver.get(SITE_URL)
-    await asyncio.sleep(10)
+    print("[Chipnwin] Starting flow...")
 
-    print("[Chipnwin] Attempting to accept cookie...")
-    for cb in COOKIE_BUTTON_XPATHS:
-        try:
-            cookie = WebDriverWait(driver, 4).until(
-                EC.element_to_be_clickable((By.XPATH, cb))
-            )
+    # First probe direct rewards. If it opens, we are truly logged in.
+    try:
+        driver.get(REWARDS_URL)
+        await asyncio.sleep(8)
+        await _accept_cookies(driver)
+    except Exception:
+        pass
 
-            if _safe_click(driver, cookie, "cookie button"):
-                await asyncio.sleep(3)
-                break
-
-        except TimeoutException:
-            pass
-        except Exception:
-            pass
-
-    if _is_logged_in(driver):
-        print("[Chipnwin] Already logged in. Using direct rewards URL.")
-        await claim_chipnwin_bonus(ctx, driver, channel)
+    if _daily_rewards_modal_open(driver):
+        print("[Chipnwin] Rewards opened immediately. User is logged in.")
+        await claim_chipnwin_bonus(ctx, driver, channel, already_open=True)
         return
 
-    print("[Chipnwin] Attempting to login...")
+    # If rewards did not open, do NOT trust broad logged-in checks.
+    # Go straight to direct login.
+    print(f"[Chipnwin] Rewards did not open. Current state: {_get_page_state(driver)}")
+    print("[Chipnwin] Logging in through direct login URL.")
 
-    try:
-        try:
-            login_btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.XPATH, LOGIN_BUTTON_XPATH))
-            )
-            _safe_click(driver, login_btn, "login button")
-            await asyncio.sleep(8)
-        except Exception as e:
-            print(f"[Chipnwin] Login button failed: {e}")
+    ok = await _login_chipnwin(ctx, driver, channel, username, password)
 
-        try:
-            email = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, EMAIL_INPUT_XPATH))
-            )
-            email.clear()
-            email.send_keys(username)
-            await asyncio.sleep(3)
-        except Exception as e:
-            print(f"[Chipnwin] Email input failed: {e}")
+    if not ok:
+        return
 
-        try:
-            pw = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.XPATH, PASSWORD_INPUT_XPATH))
-            )
-            pw.clear()
-            pw.send_keys(password)
-            await asyncio.sleep(3)
-        except Exception as e:
-            print(f"[Chipnwin] Password input failed: {e}")
-
-        submitted = False
-
-        for ls in LOGIN_SUBMIT_XPATHS:
-            try:
-                btn = WebDriverWait(driver, 6).until(
-                    EC.element_to_be_clickable((By.XPATH, ls))
-                )
-
-                if _safe_click(driver, btn, "login submit button"):
-                    submitted = True
-                    print("[Chipnwin] Submitted credentials.")
-                    await asyncio.sleep(10)
-                    break
-
-            except Exception:
-                continue
-
-        if not submitted:
-            print("[Chipnwin] Submit failed.")
-
-        print("[Chipnwin] Reloading site once...")
-        driver.refresh()
-        await asyncio.sleep(5)
-
-        await claim_chipnwin_bonus(ctx, driver, channel)
-
-    except TimeoutException as e:
-        print("[Chipnwin] Login timeout:", e)
-
-        await _send_screenshot(
-            channel,
-            driver,
-            "Chipnwin login timed out.",
-            "chipnwin_login_error.png"
-        )
+    await claim_chipnwin_bonus(ctx, driver, channel)
 
 
-# ───────────────────────────────────────────────────────────
-# 2) Claim Bonus
-# ───────────────────────────────────────────────────────────
-
-async def claim_chipnwin_bonus(ctx, driver, channel):
+async def claim_chipnwin_bonus(ctx, driver, channel, already_open: bool = False):
     print("[Chipnwin] Opening Daily Rewards...")
 
-    opened = await _open_daily_rewards(driver)
+    opened = already_open
 
     if not opened:
+        opened = await _open_daily_rewards(driver)
+
+    if not opened:
+        # It may have failed because login expired.
+        state = _get_page_state(driver)
+
+        if state == "login":
+            await _send_screenshot(
+                channel,
+                driver,
+                "[Chipnwin] Daily Rewards did not open because login is required.",
+                "chipnwin_rewards_needs_login.png"
+            )
+            return
+
         await _send_screenshot(
             channel,
             driver,
@@ -682,8 +1245,9 @@ async def claim_chipnwin_bonus(ctx, driver, channel):
         )
         return
 
-    # Main requested behavior:
-    # Read countdown FIRST. If there is a countdown, report it and stop.
+    print(f"[Chipnwin] State inside claim flow: {_get_page_state(driver)}")
+
+    # Read countdown first to avoid false-positive claims.
     print("[Chipnwin] Searching for Daily Rewards countdown candidate before claiming...")
     countdown = _read_countdown(driver, timeout=10)
 
@@ -691,18 +1255,16 @@ async def claim_chipnwin_bonus(ctx, driver, channel):
         await _send_countdown(channel, countdown)
         return
 
-    # If no countdown exists, then try claim.
-    print("[Chipnwin] No countdown found. Attempting claim...")
-    claimed = False
-
-    claim_xpath, claim_btn = _first_clickable(driver, CLAIM_BUTTON_XPATHS, timeout=8)
+    print("[Chipnwin] No countdown found. Looking for claim button...")
+    claim_xpath, claim_btn = _find_claim_button(driver, timeout=6)
 
     if claim_btn:
-        if _element_disabled_or_not_allowed(driver, claim_btn):
-            print("[Chipnwin] Claim button exists but looks disabled/not allowed.")
+        claim_text = _element_text(driver, claim_btn)
+        print(f"[Chipnwin] Claim candidate text: {claim_text!r}")
 
-            # Try one more countdown read before treating it as a real error.
-            countdown = _read_countdown(driver, timeout=5)
+        if _element_disabled_or_not_allowed(driver, claim_btn):
+            print("[Chipnwin] Claim button disabled/not allowed. Reading countdown again.")
+            countdown = _read_countdown(driver, timeout=8)
 
             if countdown:
                 await _send_countdown(channel, countdown)
@@ -722,19 +1284,18 @@ async def claim_chipnwin_bonus(ctx, driver, channel):
             await asyncio.sleep(2)
 
             if _confirm_claim_succeeded(driver, claim_btn, timeout=8):
-                claimed = True
+                await _send_screenshot(
+                    channel,
+                    driver,
+                    "Chipnwin Daily Bonus Claimed!",
+                    "chipnwin_claim.png"
+                )
+                return
 
-    if claimed:
-        await _send_screenshot(
-            channel,
-            driver,
-            "Chipnwin Daily Bonus Claimed!",
-            "chipnwin_claim.png"
-        )
-        return
+            print("[Chipnwin] Claim click did not confirm. Checking countdown.")
 
-    # If claim did not confirm, try countdown one last time.
-    countdown = _read_countdown(driver, timeout=8)
+    print("[Chipnwin] Searching for Daily Rewards countdown candidate after claim attempt...")
+    countdown = _read_countdown(driver, timeout=12)
 
     if countdown:
         await _send_countdown(channel, countdown)
@@ -749,7 +1310,7 @@ async def claim_chipnwin_bonus(ctx, driver, channel):
 
 
 # ───────────────────────────────────────────────────────────
-# 3) Standalone Countdown Reader
+# Standalone Countdown Reader
 # ───────────────────────────────────────────────────────────
 
 async def check_chipnwin_countdown(ctx, driver, channel):
@@ -780,7 +1341,7 @@ async def check_chipnwin_countdown(ctx, driver, channel):
 
 
 # ───────────────────────────────────────────────────────────
-# 4) Daily Spin Wheel
+# Daily Spin Wheel
 # ───────────────────────────────────────────────────────────
 
 async def spin_chipnwin_wheel(ctx, driver, channel):
