@@ -910,7 +910,7 @@ async def zula_uc(ctx, channel: discord.abc.Messageable):
                 await _send_status_shot(
                     sb,
                     channel,
-                    "[Zula] Bonus unavailable — today's bonus is already claimed.",
+                    "[Zula] Daily Bonus unavailable.",
                     "zula_already_claimed",
                 )
                 return
