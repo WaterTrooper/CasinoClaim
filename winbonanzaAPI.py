@@ -405,7 +405,7 @@ def open_login_page(sb: SB) -> bool:
             return False
 
     wait_ready(sb)
-    sleep(3)
+    sleep(4)
 
     return "winbonanza.com" in get_current_url(sb).lower()
 
