@@ -1,5 +1,5 @@
 # Drake Hooks + WaterTrooper
-# Casino Claim 3.4
+# Casino Claim 3
 # Zumo API
 # Version 3.4
 # Updated 2026.07.07
