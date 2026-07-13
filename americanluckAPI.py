@@ -2,6 +2,11 @@
 # Casino Claim 3
 # American Luck API — SeleniumBase UC
 #
+# Discord output policy:
+# - Send the single Launching message.
+# - Send the final screenshot with no caption or debug text.
+# - Print all status, failure, and debug details to the console only.
+#
 # Behavior:
 # 1. Logs in.
 # 2. Clears the cookie/privacy panel.
@@ -120,21 +125,29 @@ async def _send_shot(
     path: str,
     caption: str,
 ) -> None:
-    """Save a screenshot, send it to Discord, then remove it."""
+    """
+    Print the final status locally, send ONLY the screenshot to Discord,
+    then remove the temporary screenshot.
+
+    The only text message this module sends to Discord is the initial
+    "Launching American Luck (UC)..." message.
+    """
+    print(caption)
+
     try:
         sb.save_screenshot(path)
-        await channel.send(caption, file=discord.File(path))
-    except Exception:
-        try:
-            await channel.send(caption)
-        except Exception:
-            pass
+        await channel.send(file=discord.File(path))
+    except Exception as error:
+        print(f"[American Luck][SCREENSHOT ERROR] {error}")
     finally:
         try:
             if os.path.exists(path):
                 os.remove(path)
-        except Exception:
-            pass
+        except Exception as cleanup_error:
+            print(
+                "[American Luck][SCREENSHOT CLEANUP ERROR] "
+                f"{cleanup_error}"
+            )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1113,9 +1126,9 @@ async def americanluck_uc(
     creds = os.getenv("AMERICANLUCK")
 
     if not creds or ":" not in creds:
-        await channel.send(
-            "⚠️ `AMERICANLUCK` is missing from `.env`. "
-            "Expected `email:password`."
+        print(
+            "[American Luck][ERROR] AMERICANLUCK is missing from .env. "
+            "Expected email:password."
         )
         return
 
@@ -1267,9 +1280,12 @@ async def americanluck_uc(
                     f"⚠️ American Luck crashed: `{error}`",
                 )
             else:
-                await channel.send(
-                    "⚠️ American Luck crashed before the browser started: "
-                    f"`{error}`"
+                print(
+                    "[American Luck][ERROR] Crashed before the browser "
+                    f"started: {error}"
                 )
-        except Exception:
-            pass
+        except Exception as reporting_error:
+            print(
+                "[American Luck][ERROR] Failed while reporting crash: "
+                f"{reporting_error}"
+            )
