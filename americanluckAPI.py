@@ -1,160 +1,195 @@
 # Drake Hooks + WaterTrooper
-# Casino Claim 2
-# American Luck API (SeleniumBase UC)
+# Casino Claim 3
+# American Luck API — SeleniumBase UC
 #
-# Fixes:
-# - Detects and closes the "Connect with Google" / pre-connect popup before Get Coins.
-# - Uses exact popup close XPath /html/body/div[5]/div/button, but only when the Google popup is detected.
-# - Adds generic blocking-popup detection for similar future popups.
-# - Opens Get Coins with retries after popup cleanup.
-# - Claims ONLY the Daily Bonus card's Collect button.
-# - Refuses Google Grab, More Coins, Connect with Google, Buy, Checkout, etc.
+# Discord output policy:
+# - Send the single Launching message.
+# - Send the final screenshot with no caption or debug text.
+# - Print all status, failure, and debug details to the console only.
+#
+# Behavior:
+# 1. Logs in.
+# 2. Clears the cookie/privacy panel.
+# 3. Detects "YOUR DAILY BONUS IS READY!".
+# 4. Clicks "GO TO COIN STORE" inside that popup.
+# 5. If that fails, closes blocking popups and clicks GET COINS.
+# 6. Finds the card titled exactly "Daily Bonus".
+# 7. Clicks Collect only inside that card.
+#
+# It will not click:
+# - Google Grab
+# - Connect with Google
+# - More Coins
+# - Purchase buttons
+# - A random global Collect button
 
 import os
+from typing import List, Optional
+
 import discord
 from dotenv import load_dotenv
 from seleniumbase import SB
 from selenium.webdriver.common.by import By
-from selenium.common.exceptions import StaleElementReferenceException
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.common.exceptions import (
+    ElementClickInterceptedException,
+    StaleElementReferenceException,
+)
 
 
-# ───────────────────────────────────────────────────────────
-# American Luck Config and Constants
-# ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Configuration
+# ─────────────────────────────────────────────────────────────
 
 load_dotenv()
 
 LOGIN_URL = "https://americanluck.com/login"
 LOBBY_URL = "https://americanluck.com/lobby"
 
+LOGIN_BUTTON_XP = (
+    "/html/body/div[1]/div[2]/main/div/div/div/div[2]/form/div[4]/button"
+)
+
+# Keep the inspected header XPath, but also use text-based fallbacks.
 GET_COINS_BTN_XP = "/html/body/div[1]/div[2]/header/div[2]/button[1]"
 
-# Correct blocker popup close XPath from your screenshot.
-GOOGLE_PRECONNECT_CLOSE_XP = "/html/body/div[5]/div/button"
+# Previous known popup close XPath.
+# It is used only as a guarded fallback after a blocker has been detected.
+KNOWN_POPUP_CLOSE_XP = "/html/body/div[5]/div/button"
 
-# Older/general popup close path. Kept as fallback, but guarded.
-POPUP_CLOSE_XP = "/html/body/div[5]/div/button"
-
-# Correct Daily Bonus collect XPath from your inspection.
-DAILY_BONUS_EXACT_BUTTON_XP = (
-    "/html/body/div[7]/div/div/section[3]/div/div/div[1]/div/div[3]/button[1]"
+# Previous known Daily Bonus Collect XPath.
+# It is guarded by card-title verification before being clicked.
+DAILY_BONUS_EXACT_COLLECT_XP = (
+    "/html/body/div[7]/div/div/section[3]/div/div/"
+    "div[1]/div/div[3]/button[1]"
 )
 
-DAILY_BONUS_EXACT_TEXT_XP = (
-    "/html/body/div[7]/div/div/section[3]/div/div/div[1]/div/div[3]/button[1]/div[1]"
+UPPER = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+LOWER = "abcdefghijklmnopqrstuvwxyz"
+
+POPUP_ROOT_XP = (
+    "//div["
+    "contains(@class,'rag-popup') or "
+    "contains(@class,'popup') or "
+    "contains(@class,'modal') or "
+    "@role='dialog'"
+    "]"
 )
 
-# Main text-anchored Daily Bonus selector.
-DAILY_BONUS_CARD_XP = (
-    "//div[contains(@class,'dialog-container')]"
-    "//div[contains(@class,'free-reward-card')]"
-    "[.//*[contains(@class,'free-reward-card__title') "
-    "and translate(normalize-space(.), "
-    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='daily bonus']]"
+STORE_DIALOG_CSS = "div.free-coin-dialog"
+REWARD_CARD_CSS = "div.free-reward-card"
+REWARD_CARD_TITLE_CSS = ".free-reward-card__title"
+
+COOKIE_MARKERS = (
+    "we value your privacy",
+    "manage cookies",
+    "accept all",
+    "privacy policy",
 )
 
-DAILY_BONUS_COLLECT_BUTTON_XP = (
-    DAILY_BONUS_CARD_XP +
-    "//button"
-    "[contains(@class,'free-reward-card__button') "
-    "and contains(translate(normalize-space(.), "
-    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'collect') "
-    "and not(contains(translate(normalize-space(.), "
-    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'more coins'))]"
+DAILY_READY_MARKERS = (
+    "your daily bonus is ready",
+    "go to coin store",
+    "go to the coin store",
+    "uncover and collect your reward",
 )
 
-DAILY_BONUS_COLLECT_TEXT_XP = (
-    DAILY_BONUS_CARD_XP +
-    "//*[contains(@class,'button-content') "
-    "and translate(normalize-space(.), "
-    "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')='collect']"
-    "/ancestor::button[1]"
-)
-
-DAILY_BONUS_CSS_CARD = "div.free-reward-card"
-DAILY_BONUS_CSS_TITLE = ".free-reward-card__title"
-DAILY_BONUS_CSS_BUTTONS = "button.free-reward-card__button, button.rag-button"
-
-FREE_COIN_DIALOG_CSS = "div.free-coin-dialog"
-
-BLOCKING_POPUP_MARKERS = [
+GOOGLE_POPUP_MARKERS = (
     "connect with google",
-    "google rewards",
     "connect your google account",
+    "google rewards",
     "lucrative bonus",
-    "pre connect",
-    "pre-connect",
-]
+)
 
-CLAIMED_TEXT_MARKERS = [
+STORE_MARKERS = (
+    "claim free rewards",
+    "purchase store packs",
+)
+
+CLAIMED_MARKERS = (
+    "already claimed",
+    "bonus is claimed",
+    "daily bonus claimed",
     "today's bonus is claimed",
     "todays bonus is claimed",
-    "bonus is claimed",
-    "already claimed",
-    "claimed",
-]
-
-BAD_BUTTON_TEXT_MARKERS = [
-    "more coins",
-    "google",
-    "connect",
-    "buy",
-    "checkout",
-    "purchase",
-    "deposit",
-    "store pack",
-    "store packs",
-]
+)
 
 
-# ───────────────────────────────────────────────────────────
-# Generic Helpers
-# ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Discord and screenshot helpers
+# ─────────────────────────────────────────────────────────────
 
-async def _send_shot(sb: SB, channel: discord.abc.Messageable, path: str, caption: str):
-    """Save a screenshot, send it to Discord, then clean it up."""
+async def _send_shot(
+    sb: SB,
+    channel: discord.abc.Messageable,
+    path: str,
+    caption: str,
+) -> None:
+    """
+    Print the final status locally, send ONLY the screenshot to Discord,
+    then remove the temporary screenshot.
+
+    The only text message this module sends to Discord is the initial
+    "Launching American Luck (UC)..." message.
+    """
+    print(caption)
+
     try:
         sb.save_screenshot(path)
-        await channel.send(caption, file=discord.File(path))
-    except Exception:
-        try:
-            await channel.send(caption)
-        except Exception:
-            pass
+        await channel.send(file=discord.File(path))
+    except Exception as error:
+        print(f"[American Luck][SCREENSHOT ERROR] {error}")
     finally:
         try:
             if os.path.exists(path):
                 os.remove(path)
-        except Exception:
-            pass
+        except Exception as cleanup_error:
+            print(
+                "[American Luck][SCREENSHOT CLEANUP ERROR] "
+                f"{cleanup_error}"
+            )
 
 
-def _norm(text: str) -> str:
-    return " ".join((text or "").lower().split())
+# ─────────────────────────────────────────────────────────────
+# Generic DOM helpers
+# ─────────────────────────────────────────────────────────────
+
+def _norm(value: str) -> str:
+    return " ".join((value or "").lower().split())
 
 
-def _safe_element_text(sb: SB, el) -> str:
+def _safe_text(sb: SB, element: WebElement) -> str:
     try:
-        text = el.text
+        text = element.text
         if text:
             return text
     except Exception:
         pass
 
     try:
-        return sb.execute_script(
-            "return arguments[0].innerText || arguments[0].textContent || '';",
-            el,
-        ) or ""
+        return (
+            sb.execute_script(
+                """
+                return arguments[0].innerText ||
+                       arguments[0].textContent ||
+                       '';
+                """,
+                element,
+            )
+            or ""
+        )
     except Exception:
         return ""
 
 
 def _page_text(sb: SB) -> str:
     try:
-        return sb.execute_script(
-            "return document.body ? document.body.innerText : '';"
-        ) or ""
+        return (
+            sb.execute_script(
+                "return document.body ? document.body.innerText : '';"
+            )
+            or ""
+        )
     except Exception:
         try:
             return sb.get_text("body")
@@ -162,23 +197,29 @@ def _page_text(sb: SB) -> str:
             return ""
 
 
-def _is_visible_enabled(el) -> bool:
+def _is_visible(element: WebElement) -> bool:
     try:
-        return el.is_displayed() and el.is_enabled()
+        return element.is_displayed()
     except Exception:
         return False
 
 
-def _is_probably_disabled(el) -> bool:
+def _is_enabled(element: WebElement) -> bool:
     try:
-        disabled = el.get_attribute("disabled")
-        aria_disabled = el.get_attribute("aria-disabled")
-        classes = _norm(el.get_attribute("class") or "")
+        return element.is_enabled()
+    except Exception:
+        return False
 
-        if disabled is not None:
+
+def _is_disabled(element: WebElement) -> bool:
+    try:
+        if element.get_attribute("disabled") is not None:
             return True
-        if aria_disabled == "true":
+
+        if _norm(element.get_attribute("aria-disabled") or "") == "true":
             return True
+
+        classes = _norm(element.get_attribute("class") or "")
         if "disabled" in classes:
             return True
     except Exception:
@@ -187,506 +228,331 @@ def _is_probably_disabled(el) -> bool:
     return False
 
 
-def _find_elements_css(sb: SB, css: str):
-    try:
-        return sb.driver.find_elements(By.CSS_SELECTOR, css)
-    except Exception:
-        return []
-
-
-def _find_elements_xpath(sb: SB, xpath: str):
+def _find_xpath(sb: SB, xpath: str) -> List[WebElement]:
     try:
         return sb.driver.find_elements(By.XPATH, xpath)
     except Exception:
         return []
 
 
-def _button_from_element(el):
+def _find_css(sb: SB, css: str) -> List[WebElement]:
     try:
-        tag = (el.tag_name or "").lower()
-        if tag == "button":
-            return el
+        return sb.driver.find_elements(By.CSS_SELECTOR, css)
     except Exception:
-        return el
+        return []
 
+
+def _button_from_element(element: WebElement) -> WebElement:
+    """Return the nearest button when passed a child such as button-content."""
     try:
-        return el.find_element(By.XPATH, "./ancestor::button[1]")
+        if (element.tag_name or "").lower() == "button":
+            return element
     except Exception:
-        return el
+        return element
 
-
-def _click_element_hard(sb: SB, el) -> bool:
     try:
-        el = _button_from_element(el)
+        return element.find_element(By.XPATH, "./ancestor::button[1]")
+    except Exception:
+        return element
+
+
+def _element_area(element: WebElement) -> float:
+    try:
+        rect = element.rect
+        return max(float(rect["width"]) * float(rect["height"]), 1.0)
+    except Exception:
+        return float("inf")
+
+
+def _element_depth(sb: SB, element: WebElement) -> int:
+    try:
+        return int(
+            sb.execute_script(
+                """
+                let depth = 0;
+                let node = arguments[0];
+
+                while (node && node.parentElement) {
+                    depth++;
+                    node = node.parentElement;
+                }
+
+                return depth;
+                """,
+                element,
+            )
+        )
+    except Exception:
+        return 0
+
+
+def _hard_click(sb: SB, element: WebElement) -> bool:
+    """Click using native, ActionChains, JavaScript, and event fallbacks."""
+    try:
+        element = _button_from_element(element)
     except Exception:
         pass
 
+    if not _is_visible(element):
+        return False
+
+    if _is_disabled(element):
+        return False
+
     try:
         sb.execute_script(
-            "arguments[0].scrollIntoView({block:'center', inline:'center'});",
-            el,
+            """
+            arguments[0].scrollIntoView({
+                block: 'center',
+                inline: 'center'
+            });
+            """,
+            element,
         )
         sb.wait(0.35)
     except Exception:
         pass
 
+    # Normal Selenium click.
     try:
-        el.click()
+        element.click()
+        return True
+    except (
+        ElementClickInterceptedException,
+        StaleElementReferenceException,
+    ):
+        pass
+    except Exception:
+        pass
+
+    # SeleniumBase ActionChains click.
+    try:
+        sb.driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});",
+            element,
+        )
+        sb.driver.switch_to.active_element
+        sb.wait(0.2)
+
+        from selenium.webdriver.common.action_chains import ActionChains
+
+        ActionChains(sb.driver).move_to_element(element).pause(0.2).click().perform()
         return True
     except Exception:
         pass
 
+    # JavaScript click.
     try:
-        sb.execute_script("arguments[0].click();", el)
+        sb.execute_script("arguments[0].click();", element)
         return True
     except Exception:
         pass
 
+    # Full pointer/mouse event sequence.
     try:
         sb.execute_script(
             """
             const el = arguments[0];
-            el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true}));
-            el.dispatchEvent(new MouseEvent('mouseup', {bubbles:true}));
-            el.dispatchEvent(new MouseEvent('click', {bubbles:true}));
+
+            const events = [
+                'pointerover',
+                'mouseover',
+                'pointerenter',
+                'mouseenter',
+                'pointerdown',
+                'mousedown',
+                'pointerup',
+                'mouseup',
+                'click'
+            ];
+
+            for (const type of events) {
+                const EventClass = type.startsWith('pointer')
+                    ? PointerEvent
+                    : MouseEvent;
+
+                el.dispatchEvent(
+                    new EventClass(type, {
+                        bubbles: true,
+                        cancelable: true,
+                        view: window
+                    })
+                );
+            }
             """,
-            el,
+            element,
         )
         return True
     except Exception:
-        pass
-
-    return False
+        return False
 
 
-def _force_click_xpath(sb: SB, xpath: str, timeout: float = 10) -> bool:
+def _click_xpath(
+    sb: SB,
+    xpath: str,
+    timeout: float = 5,
+) -> bool:
     try:
         sb.wait_for_element_visible(xpath, timeout=timeout)
     except Exception:
         return False
 
-    try:
-        elements = _find_elements_xpath(sb, xpath)
-        for el in elements:
-            if _is_visible_enabled(el):
-                return _click_element_hard(sb, el)
-    except Exception:
-        pass
-
-    try:
-        sb.scroll_to(xpath)
-    except Exception:
-        pass
-
-    for mode in ("click", "slow", "js", "directjs"):
-        try:
-            if mode == "click":
-                sb.click_xpath(xpath, timeout=4)
-            elif mode == "slow":
-                sb.slow_click(xpath)
-            elif mode == "js":
-                sb.js_click(xpath)
-            else:
-                el = sb.driver.find_element(By.XPATH, xpath)
-                sb.execute_script("arguments[0].click();", el)
-            return True
-        except Exception:
-            continue
+    for element in _find_xpath(sb, xpath):
+        if _is_visible(element) and _is_enabled(element):
+            if _hard_click(sb, element):
+                return True
 
     return False
 
 
-# ───────────────────────────────────────────────────────────
-# Blocking Popup Manager
-# ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Popup discovery
+# ─────────────────────────────────────────────────────────────
 
-def _has_blocking_google_popup(sb: SB) -> bool:
-    text = _norm(_page_text(sb))
-    return any(marker in text for marker in BLOCKING_POPUP_MARKERS)
-
-
-def _is_get_coins_modal_open(sb: SB) -> bool:
+def _popup_matches(
+    sb: SB,
+    popup: WebElement,
+    markers: tuple[str, ...],
+) -> bool:
     try:
-        dialogs = _find_elements_css(sb, FREE_COIN_DIALOG_CSS)
-        for dialog in dialogs:
-            if dialog.is_displayed():
-                return True
-    except Exception:
-        pass
-
-    text = _norm(_page_text(sb))
-    return "claim free rewards" in text and "purchase store packs" in text
-
-
-def _close_blocking_popup_with_js(sb: SB) -> bool:
-    """
-    Generic popup closer.
-
-    It only targets popup/modal roots containing blocking Google/pre-connect text.
-    It intentionally avoids the Get Coins free-coin dialog.
-    """
-    try:
-        return bool(
-            sb.execute_script(
-                """
-                const markers = [
-                    'connect with google',
-                    'google rewards',
-                    'connect your google account',
-                    'lucrative bonus',
-                    'pre connect',
-                    'pre-connect'
-                ];
-
-                const lower = s => (s || '').toLowerCase().replace(/\\s+/g, ' ').trim();
-
-                const visible = el => {
-                    if (!el) return false;
-                    const r = el.getBoundingClientRect();
-                    const style = window.getComputedStyle(el);
-                    return (
-                        r.width > 0 &&
-                        r.height > 0 &&
-                        style.visibility !== 'hidden' &&
-                        style.display !== 'none' &&
-                        style.opacity !== '0'
-                    );
-                };
-
-                const roots = [...document.querySelectorAll(
-                    "div[class*='popup'], div[class*='modal'], div[role='dialog'], div[class*='backdrop']"
-                )].filter(visible);
-
-                for (const root of roots) {
-                    const rootClass = lower(root.className);
-                    const txt = lower(root.innerText || root.textContent || '');
-
-                    // Do not close the real Get Coins modal.
-                    if (rootClass.includes('free-coin-dialog')) {
-                        continue;
-                    }
-
-                    if (!markers.some(m => txt.includes(m))) {
-                        continue;
-                    }
-
-                    const buttons = [...root.querySelectorAll('button')].filter(visible);
-
-                    const closeBtn =
-                        buttons.find(b => {
-                            const cls = lower(b.className);
-                            const aria = lower(b.getAttribute('aria-label'));
-                            const title = lower(b.getAttribute('title'));
-                            return (
-                                cls.includes('close') ||
-                                aria.includes('close') ||
-                                title.includes('close')
-                            );
-                        }) ||
-                        buttons.find(b => {
-                            // Fallback for icon-only X buttons.
-                            const cls = lower(b.className);
-                            const rect = b.getBoundingClientRect();
-                            const rootRect = root.getBoundingClientRect();
-
-                            const nearTopRight =
-                                rect.top <= rootRect.top + 80 &&
-                                rect.left >= rootRect.right - 120;
-
-                            return (
-                                b.querySelector('svg') &&
-                                nearTopRight &&
-                                !lower(b.innerText).includes('connect')
-                            );
-                        });
-
-                    if (closeBtn) {
-                        closeBtn.click();
-                        return true;
-                    }
-                }
-
-                return false;
-                """
-            )
-        )
-    except Exception:
-        return False
-
-
-def _close_blocking_popup_by_xpath(sb: SB) -> bool:
-    """
-    XPath-based closer for the known Google popup.
-    Uses your exact /html/body/div[5]/div/button path, but only when blocker text exists.
-    """
-    if not _has_blocking_google_popup(sb):
-        return False
-
-    for xp in [
-        GOOGLE_PRECONNECT_CLOSE_XP,
-        POPUP_CLOSE_XP,
-        "//div[contains(@class,'pre-connect-info-dialog-popup')]//button[contains(@class,'close')]",
-        "//div[contains(@class,'rag-popup') and .//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'connect with google')]]//button[contains(@class,'close')]",
-        "//*[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'connect with google')]/ancestor::*[contains(@class,'popup') or contains(@class,'modal') or @role='dialog'][1]//button[contains(@class,'close')]",
-    ]:
-        try:
-            if _force_click_xpath(sb, xp, timeout=1.5):
-                return True
-        except Exception:
-            continue
-
-    return False
-
-
-def _close_blocking_popups(sb: SB, max_rounds: int = 4) -> int:
-    """
-    Close Google/pre-connect blocker popups before trying Get Coins.
-
-    Returns number of close attempts that succeeded.
-    """
-    closed_count = 0
-
-    for _ in range(max_rounds):
-        if _is_get_coins_modal_open(sb):
-            break
-
-        found_blocker = _has_blocking_google_popup(sb)
-
-        if not found_blocker:
-            break
-
-        closed = False
-
-        if _close_blocking_popup_by_xpath(sb):
-            closed = True
-        elif _close_blocking_popup_with_js(sb):
-            closed = True
-        else:
-            try:
-                sb.press_keys("body", "ESCAPE")
-                sb.wait(0.5)
-                closed = not _has_blocking_google_popup(sb)
-            except Exception:
-                closed = False
-
-        if not closed:
-            break
-
-        closed_count += 1
-        sb.wait(1)
-
-    return closed_count
-
-
-def _open_get_coins_modal(sb: SB) -> bool:
-    """
-    Open Get Coins intelligently.
-
-    It repeatedly:
-    - closes blockers,
-    - checks if modal is already open,
-    - clicks Get Coins,
-    - closes any blocker that appeared,
-    - confirms the Get Coins modal is open.
-    """
-    for attempt in range(1, 6):
-        sb.wait_for_ready_state_complete()
-
-        _close_blocking_popups(sb, max_rounds=4)
-
-        if _is_get_coins_modal_open(sb):
-            return True
-
-        clicked = _force_click_xpath(sb, GET_COINS_BTN_XP, timeout=6)
-
-        sb.wait(1.5)
-        sb.wait_for_ready_state_complete()
-
-        # Sometimes clicking Get Coins triggers/reveals the Google popup instead.
-        if _has_blocking_google_popup(sb):
-            _close_blocking_popups(sb, max_rounds=4)
-            sb.wait(1)
-
-        if _is_get_coins_modal_open(sb):
-            return True
-
-        # One more try after cleanup.
-        if not clicked:
-            _close_blocking_popups(sb, max_rounds=4)
-
-        sb.wait(1)
-
-    return _is_get_coins_modal_open(sb)
-
-
-# ───────────────────────────────────────────────────────────
-# Daily Bonus Specific Logic
-# ───────────────────────────────────────────────────────────
-
-def _scroll_rewards_into_view(sb: SB):
-    try:
-        sb.execute_script(
-            """
-            const title = [...document.querySelectorAll('h2,h3,div,section')]
-                .find(el => /claim free rewards/i.test(el.innerText || ''));
-
-            if (title) {
-                title.scrollIntoView({block:'center', inline:'center'});
-                return;
-            }
-
-            const dialog =
-                document.querySelector('div.dialog-container div.free-coin-dialog') ||
-                document.querySelector('div.dialog-container') ||
-                document.scrollingElement;
-
-            if (dialog) {
-                dialog.scrollTop = Math.floor(dialog.scrollHeight * 0.70);
-            }
-            """
-        )
-        sb.wait(0.75)
-    except Exception:
-        pass
-
-
-def _get_card_title(sb: SB, card) -> str:
-    try:
-        title = card.find_element(By.CSS_SELECTOR, DAILY_BONUS_CSS_TITLE)
-        return _norm(_safe_element_text(sb, title))
-    except Exception:
-        return ""
-
-
-def _is_daily_bonus_card(sb: SB, card) -> bool:
-    title = _get_card_title(sb, card)
-
-    if title == "daily bonus":
-        return True
-
-    card_text = _norm(_safe_element_text(sb, card))
-    return "daily bonus" in card_text and "google grab" not in card_text
-
-
-def _get_ancestor_card(sb: SB, el):
-    try:
-        return el.find_element(
-            By.XPATH,
-            "./ancestor::*[contains(@class,'free-reward-card')][1]",
-        )
-    except Exception:
-        return None
-
-
-def _button_belongs_to_daily_bonus(sb: SB, button) -> bool:
-    card = _get_ancestor_card(sb, button)
-
-    if card is None:
-        return False
-
-    return _is_daily_bonus_card(sb, card)
-
-
-def _button_text_is_valid_daily_collect(sb: SB, button) -> bool:
-    text = _norm(_safe_element_text(sb, button))
-
-    if "collect" not in text:
-        return False
-
-    for bad in BAD_BUTTON_TEXT_MARKERS:
-        if bad in text:
+        if not _is_visible(popup):
             return False
 
-    if _is_probably_disabled(button):
+        classes = _norm(popup.get_attribute("class") or "")
+
+        # Never mistake the actual coin-store dialog for a blocker.
+        if "free-coin-dialog" in classes:
+            return False
+
+        text = _norm(_safe_text(sb, popup))
+        return any(marker in text for marker in markers)
+    except Exception:
         return False
 
-    return True
 
+def _find_matching_popup(
+    sb: SB,
+    markers: tuple[str, ...],
+) -> Optional[WebElement]:
+    """
+    Find the most specific visible popup containing one of the supplied markers.
 
-def _find_daily_bonus_card_by_css(sb: SB):
-    cards = _find_elements_css(sb, DAILY_BONUS_CSS_CARD)
+    Smallest area and deepest DOM node are preferred so a large parent
+    container is not selected instead of the actual popup.
+    """
+    candidates: List[WebElement] = []
 
-    for card in cards:
+    for popup in _find_xpath(sb, POPUP_ROOT_XP):
         try:
-            if not card.is_displayed():
-                continue
-
-            if _is_daily_bonus_card(sb, card):
-                return card
+            if _popup_matches(sb, popup, markers):
+                candidates.append(popup)
         except StaleElementReferenceException:
             continue
         except Exception:
             continue
 
-    return None
+    if not candidates:
+        return None
+
+    candidates.sort(
+        key=lambda element: (
+            _element_area(element),
+            -_element_depth(sb, element),
+        )
+    )
+
+    return candidates[0]
 
 
-def _find_daily_bonus_card_by_xpath(sb: SB):
-    cards = _find_elements_xpath(sb, DAILY_BONUS_CARD_XP)
-
-    for card in cards:
-        try:
-            if card.is_displayed() and _is_daily_bonus_card(sb, card):
-                return card
-        except Exception:
-            continue
-
-    return None
-
-
-def _find_daily_bonus_card(sb: SB):
-    card = _find_daily_bonus_card_by_css(sb)
-
-    if card is not None:
-        return card
-
-    return _find_daily_bonus_card_by_xpath(sb)
-
-
-def _find_collect_button_inside_daily_card(sb: SB, card):
+def _popup_button_by_text(
+    sb: SB,
+    popup: WebElement,
+    phrases: tuple[str, ...],
+    exact: bool = False,
+) -> Optional[WebElement]:
     try:
-        buttons = card.find_elements(By.CSS_SELECTOR, DAILY_BONUS_CSS_BUTTONS)
+        buttons = popup.find_elements(By.TAG_NAME, "button")
     except Exception:
         buttons = []
 
-    valid = []
-
     for button in buttons:
         try:
-            if not _is_visible_enabled(button):
+            if not _is_visible(button):
                 continue
 
-            if not _button_text_is_valid_daily_collect(sb, button):
+            if _is_disabled(button):
                 continue
 
-            if not _button_belongs_to_daily_bonus(sb, button):
-                continue
+            text = _norm(_safe_text(sb, button))
 
-            valid.append(button)
-        except StaleElementReferenceException:
-            continue
+            if exact:
+                if text in phrases:
+                    return button
+            elif any(phrase in text for phrase in phrases):
+                return button
         except Exception:
             continue
 
-    if valid:
-        return valid[0]
+    return None
 
+
+def _popup_close_button(
+    sb: SB,
+    popup: WebElement,
+) -> Optional[WebElement]:
     try:
-        xpath_buttons = card.find_elements(
-            By.XPATH,
-            ".//button"
-            "[contains(translate(normalize-space(.), "
-            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'collect') "
-            "and not(contains(translate(normalize-space(.), "
-            "'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'more coins'))]",
-        )
+        buttons = popup.find_elements(By.TAG_NAME, "button")
+    except Exception:
+        buttons = []
 
-        for button in xpath_buttons:
+    explicit: List[WebElement] = []
+    icon_buttons: List[WebElement] = []
+
+    for button in buttons:
+        try:
+            if not _is_visible(button):
+                continue
+
+            classes = _norm(button.get_attribute("class") or "")
+            aria = _norm(button.get_attribute("aria-label") or "")
+            title = _norm(button.get_attribute("title") or "")
+            text = _norm(_safe_text(sb, button))
+
             if (
-                _is_visible_enabled(button)
-                and _button_text_is_valid_daily_collect(sb, button)
-                and _button_belongs_to_daily_bonus(sb, button)
+                "close" in classes
+                or "close" in aria
+                or "close" in title
+                or text in {"x", "×", "✕", "✖"}
             ):
+                explicit.append(button)
+                continue
+
+            try:
+                if button.find_elements(By.TAG_NAME, "svg"):
+                    icon_buttons.append(button)
+            except Exception:
+                pass
+        except Exception:
+            continue
+
+    if explicit:
+        return explicit[0]
+
+    # Select an icon-only button near the popup's upper-right corner.
+    try:
+        popup_rect = popup.rect
+        popup_top = float(popup_rect["y"])
+        popup_right = float(popup_rect["x"]) + float(popup_rect["width"])
+
+        for button in icon_buttons:
+            rect = button.rect
+            button_top = float(rect["y"])
+            button_right = float(rect["x"]) + float(rect["width"])
+
+            near_top = button_top <= popup_top + 120
+            near_right = button_right >= popup_right - 150
+
+            if near_top and near_right:
                 return button
     except Exception:
         pass
@@ -694,201 +560,590 @@ def _find_collect_button_inside_daily_card(sb: SB, card):
     return None
 
 
-def _find_daily_collect_by_anchored_xpath(sb: SB):
-    for xp in [
-        DAILY_BONUS_COLLECT_BUTTON_XP,
-        DAILY_BONUS_COLLECT_TEXT_XP,
-    ]:
-        for el in _find_elements_xpath(sb, xp):
-            try:
-                button = _button_from_element(el)
+def _close_popup(
+    sb: SB,
+    popup: WebElement,
+) -> bool:
+    button = _popup_close_button(sb, popup)
 
-                if not _is_visible_enabled(button):
-                    continue
+    if button is not None and _hard_click(sb, button):
+        sb.wait(0.8)
+        return True
 
-                if not _button_text_is_valid_daily_collect(sb, button):
-                    continue
+    # Guarded fallback using the previously inspected close XPath.
+    try:
+        if _click_xpath(sb, KNOWN_POPUP_CLOSE_XP, timeout=1):
+            sb.wait(0.8)
+            return True
+    except Exception:
+        pass
 
-                if not _button_belongs_to_daily_bonus(sb, button):
-                    continue
+    try:
+        sb.press_keys("body", "ESCAPE")
+        sb.wait(0.8)
+        return not _is_visible(popup)
+    except Exception:
+        return False
 
-                return button
-            except Exception:
-                continue
+
+# ─────────────────────────────────────────────────────────────
+# Cookie/privacy popup
+# ─────────────────────────────────────────────────────────────
+
+def _handle_cookie_popup(sb: SB) -> bool:
+    popup = _find_matching_popup(sb, COOKIE_MARKERS)
+
+    if popup is None:
+        return False
+
+    # Prefer accepting so it does not return on subsequent runs.
+    accept_button = _popup_button_by_text(
+        sb,
+        popup,
+        (
+            "accept all",
+            "accept cookies",
+            "allow all",
+            "agree",
+        ),
+    )
+
+    if accept_button is not None:
+        if _hard_click(sb, accept_button):
+            sb.wait(1)
+            return True
+
+    return _close_popup(sb, popup)
+
+
+# ─────────────────────────────────────────────────────────────
+# Daily Bonus Ready popup
+# ─────────────────────────────────────────────────────────────
+
+def _handle_daily_ready_popup(sb: SB) -> str:
+    """
+    Returns:
+        "none"         — popup not present
+        "store_clicked" — Go To Coin Store clicked
+        "closed"       — popup could not open store, but was closed
+        "blocked"      — popup could not be handled
+    """
+    popup = _find_matching_popup(sb, DAILY_READY_MARKERS)
+
+    if popup is None:
+        return "none"
+
+    # This is the preferred route. Do not close the modal first.
+    store_button = _popup_button_by_text(
+        sb,
+        popup,
+        (
+            "go to coin store",
+            "go to the coin store",
+            "coin store",
+        ),
+    )
+
+    if store_button is not None:
+        if _hard_click(sb, store_button):
+            sb.wait(2)
+            return "store_clicked"
+
+    # Global text-anchored fallback, still requiring the ready-popup text.
+    global_store_xp = (
+        "//button["
+        "contains("
+        f"translate(normalize-space(.),'{UPPER}','{LOWER}'),"
+        "'go to coin store'"
+        ")"
+        "]"
+    )
+
+    if _click_xpath(sb, global_store_xp, timeout=2):
+        sb.wait(2)
+        return "store_clicked"
+
+    # If the button itself cannot be used, remove the popup so GET COINS
+    # can be clicked normally.
+    if _close_popup(sb, popup):
+        return "closed"
+
+    return "blocked"
+
+
+# ─────────────────────────────────────────────────────────────
+# Connect with Google popup
+# ─────────────────────────────────────────────────────────────
+
+def _handle_google_popup(sb: SB) -> bool:
+    popup = _find_matching_popup(sb, GOOGLE_POPUP_MARKERS)
+
+    if popup is None:
+        return False
+
+    return _close_popup(sb, popup)
+
+
+# ─────────────────────────────────────────────────────────────
+# Store detection and opening
+# ─────────────────────────────────────────────────────────────
+
+def _store_dialog_open(sb: SB) -> bool:
+    for dialog in _find_css(sb, STORE_DIALOG_CSS):
+        try:
+            if _is_visible(dialog):
+                return True
+        except Exception:
+            continue
+
+    text = _norm(_page_text(sb))
+
+    return all(marker in text for marker in STORE_MARKERS)
+
+
+def _get_coins_button(sb: SB) -> Optional[WebElement]:
+    # First use the inspected XPath.
+    for element in _find_xpath(sb, GET_COINS_BTN_XP):
+        try:
+            if (
+                _is_visible(element)
+                and _is_enabled(element)
+                and not _is_disabled(element)
+            ):
+                return element
+        except Exception:
+            continue
+
+    # Stable text-anchored header selector.
+    xpath = (
+        "//header//button["
+        "contains("
+        f"translate(normalize-space(.),'{UPPER}','{LOWER}'),"
+        "'get coins'"
+        ")"
+        "]"
+    )
+
+    for element in _find_xpath(sb, xpath):
+        try:
+            if (
+                _is_visible(element)
+                and _is_enabled(element)
+                and not _is_disabled(element)
+            ):
+                return element
+        except Exception:
+            continue
+
+    # Last text-based fallback outside the header.
+    xpath = (
+        "//button["
+        "translate("
+        f"normalize-space(.),'{UPPER}','{LOWER}'"
+        ")='get coins'"
+        "]"
+    )
+
+    for element in _find_xpath(sb, xpath):
+        try:
+            if (
+                _is_visible(element)
+                and _is_enabled(element)
+                and not _is_disabled(element)
+            ):
+                return element
+        except Exception:
+            continue
 
     return None
 
 
-def _find_daily_collect_by_exact_xpath_guarded(sb: SB):
-    for xp in [
-        DAILY_BONUS_EXACT_BUTTON_XP,
-        DAILY_BONUS_EXACT_TEXT_XP,
-    ]:
-        for el in _find_elements_xpath(sb, xp):
-            try:
-                button = _button_from_element(el)
+def _click_get_coins(sb: SB) -> bool:
+    button = _get_coins_button(sb)
 
-                if not _is_visible_enabled(button):
-                    continue
+    if button is None:
+        return False
 
-                if not _button_text_is_valid_daily_collect(sb, button):
-                    continue
+    return _hard_click(sb, button)
 
-                if not _button_belongs_to_daily_bonus(sb, button):
-                    continue
 
-                return button
-            except Exception:
+def _refresh_lobby(sb: SB) -> None:
+    try:
+        sb.refresh_page()
+    except Exception:
+        try:
+            sb.execute_script("window.location.reload();")
+        except Exception:
+            return
+
+    sb.wait(5)
+
+    try:
+        sb.wait_for_ready_state_complete()
+    except Exception:
+        pass
+
+
+def _open_coin_store(sb: SB) -> bool:
+    """
+    Intelligent store-opening state machine.
+
+    Priority:
+    1. Accept cookie banner.
+    2. Click Go To Coin Store in the ready popup.
+    3. Close Connect with Google.
+    4. Click header GET COINS.
+    5. Refresh and repeat as a limited fallback.
+    """
+    refreshes_used = 0
+
+    for attempt in range(1, 9):
+        try:
+            sb.wait_for_ready_state_complete()
+        except Exception:
+            pass
+
+        if _store_dialog_open(sb):
+            return True
+
+        changed = False
+
+        # Cookie consent can overlap the lower-right area and intercept clicks.
+        if _handle_cookie_popup(sb):
+            changed = True
+            sb.wait(0.8)
+
+        if _store_dialog_open(sb):
+            return True
+
+        # The daily-ready popup is not an error. Use its store button.
+        ready_result = _handle_daily_ready_popup(sb)
+
+        if ready_result == "store_clicked":
+            sb.wait(2)
+
+            if _store_dialog_open(sb):
+                return True
+
+            changed = True
+
+        elif ready_result == "closed":
+            changed = True
+            sb.wait(0.8)
+
+        elif ready_result == "blocked":
+            changed = True
+
+        if _store_dialog_open(sb):
+            return True
+
+        # Remove Google promotion popup when present.
+        if _handle_google_popup(sb):
+            changed = True
+            sb.wait(0.8)
+
+        if _store_dialog_open(sb):
+            return True
+
+        # After blockers are gone, use the normal header button.
+        if _click_get_coins(sb):
+            changed = True
+            sb.wait(2)
+
+            if _store_dialog_open(sb):
+                return True
+
+            # Clicking GET COINS may reveal another popup. The next loop
+            # handles that popup instead of immediately failing.
+            continue
+
+        # If DOM changed during popup dismissal, wait before rescanning.
+        if changed:
+            sb.wait(1)
+            continue
+
+        # Limited refresh fallback. Do not refresh indefinitely.
+        if attempt in {3, 6} and refreshes_used < 2:
+            refreshes_used += 1
+            _refresh_lobby(sb)
+            continue
+
+        sb.wait(1)
+
+    return _store_dialog_open(sb)
+
+
+# ─────────────────────────────────────────────────────────────
+# Daily Bonus card and Collect button
+# ─────────────────────────────────────────────────────────────
+
+def _scroll_store_to_rewards(sb: SB) -> None:
+    try:
+        sb.execute_script(
+            """
+            const dialog =
+                document.querySelector('.free-coin-dialog') ||
+                document.querySelector('.dialog-container');
+
+            const rewardTitle = [...document.querySelectorAll('h2,h3')]
+                .find(el =>
+                    /claim free rewards/i.test(
+                        el.innerText || el.textContent || ''
+                    )
+                );
+
+            if (rewardTitle) {
+                rewardTitle.scrollIntoView({
+                    block: 'center',
+                    inline: 'center'
+                });
+            }
+
+            if (dialog) {
+                const scrollContainers = [
+                    dialog,
+                    ...dialog.querySelectorAll(
+                        "[class*='scroll'], [style*='overflow']"
+                    )
+                ];
+
+                for (const container of scrollContainers) {
+                    if (container.scrollHeight > container.clientHeight) {
+                        container.scrollTop = container.scrollHeight;
+                    }
+                }
+            }
+            """
+        )
+        sb.wait(1)
+    except Exception:
+        pass
+
+
+def _reward_card_title(
+    sb: SB,
+    card: WebElement,
+) -> str:
+    try:
+        title = card.find_element(By.CSS_SELECTOR, REWARD_CARD_TITLE_CSS)
+        return _norm(_safe_text(sb, title))
+    except Exception:
+        pass
+
+    # Class fallback if title class changes.
+    try:
+        headings = card.find_elements(By.XPATH, ".//h1 | .//h2 | .//h3 | .//h4")
+
+        for heading in headings:
+            text = _norm(_safe_text(sb, heading))
+            if text:
+                return text
+    except Exception:
+        pass
+
+    return ""
+
+
+def _daily_bonus_card(sb: SB) -> Optional[WebElement]:
+    for card in _find_css(sb, REWARD_CARD_CSS):
+        try:
+            if not _is_visible(card):
                 continue
+
+            title = _reward_card_title(sb, card)
+
+            # Require the actual card title.
+            if title == "daily bonus":
+                return card
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            continue
+
+    # XPath title fallback.
+    xpath = (
+        "//div[contains(@class,'free-reward-card')]"
+        "[.//*[contains(@class,'free-reward-card__title') "
+        "and translate("
+        f"normalize-space(.),'{UPPER}','{LOWER}'"
+        ")='daily bonus']]"
+    )
+
+    for card in _find_xpath(sb, xpath):
+        try:
+            if _is_visible(card):
+                return card
+        except Exception:
+            continue
 
     return None
 
 
-def _build_daily_bonus_predictive_xpaths():
-    xpaths = []
+def _collect_button_inside_card(
+    sb: SB,
+    card: WebElement,
+) -> Optional[WebElement]:
+    try:
+        buttons = card.find_elements(By.TAG_NAME, "button")
+    except Exception:
+        buttons = []
 
-    body_div_indexes = range(4, 12)
-    section_indexes = range(2, 5)
-    card_indexes = range(1, 4)
-
-    for body_div in body_div_indexes:
-        for section in section_indexes:
-            for card in card_indexes:
-                base_button = (
-                    f"/html/body/div[{body_div}]/div/div/"
-                    f"section[{section}]/div/div/div[{card}]/div/div[3]/button[1]"
-                )
-
-                xpaths.append(base_button)
-                xpaths.append(base_button + "/div[1]")
-
-    return xpaths
-
-
-def _find_daily_collect_by_predictive_xpath_guarded(sb: SB):
-    for xp in _build_daily_bonus_predictive_xpaths():
-        for el in _find_elements_xpath(sb, xp):
-            try:
-                button = _button_from_element(el)
-
-                if not _is_visible_enabled(button):
-                    continue
-
-                if not _button_text_is_valid_daily_collect(sb, button):
-                    continue
-
-                if not _button_belongs_to_daily_bonus(sb, button):
-                    continue
-
-                return button
-            except Exception:
+    for button in buttons:
+        try:
+            if not _is_visible(button):
                 continue
+
+            if not _is_enabled(button) or _is_disabled(button):
+                continue
+
+            text = _norm(_safe_text(sb, button))
+
+            # Exact Collect only.
+            if text != "collect":
+                continue
+
+            return button
+        except StaleElementReferenceException:
+            continue
+        except Exception:
+            continue
+
+    return None
+
+
+def _exact_collect_xpath_guarded(sb: SB) -> Optional[WebElement]:
+    """
+    Use today's inspected XPath only when it belongs to a card whose title
+    is exactly Daily Bonus.
+    """
+    for element in _find_xpath(sb, DAILY_BONUS_EXACT_COLLECT_XP):
+        try:
+            button = _button_from_element(element)
+
+            if not _is_visible(button):
+                continue
+
+            if _norm(_safe_text(sb, button)) != "collect":
+                continue
+
+            card = button.find_element(
+                By.XPATH,
+                "./ancestor::div[contains(@class,'free-reward-card')][1]",
+            )
+
+            if _reward_card_title(sb, card) != "daily bonus":
+                continue
+
+            return button
+        except Exception:
+            continue
 
     return None
 
 
 def _click_daily_bonus_collect(sb: SB) -> bool:
-    """
-    Correct Daily Bonus clicker.
-
-    It only clicks Collect if the button belongs to the Daily Bonus card.
-    """
-    if not _is_get_coins_modal_open(sb):
+    if not _store_dialog_open(sb):
         return False
 
-    _scroll_rewards_into_view(sb)
+    _scroll_store_to_rewards(sb)
 
-    card = _find_daily_bonus_card(sb)
+    # Preferred approach: locate card title first.
+    card = _daily_bonus_card(sb)
 
     if card is not None:
-        button = _find_collect_button_inside_daily_card(sb, card)
+        button = _collect_button_inside_card(sb, card)
+
         if button is not None:
-            return _click_element_hard(sb, button)
+            return _hard_click(sb, button)
 
-    button = _find_daily_collect_by_anchored_xpath(sb)
-    if button is not None:
-        return _click_element_hard(sb, button)
+    # Guarded inspected XPath fallback.
+    button = _exact_collect_xpath_guarded(sb)
 
-    button = _find_daily_collect_by_exact_xpath_guarded(sb)
     if button is not None:
-        return _click_element_hard(sb, button)
-
-    button = _find_daily_collect_by_predictive_xpath_guarded(sb)
-    if button is not None:
-        return _click_element_hard(sb, button)
+        return _hard_click(sb, button)
 
     return False
 
 
-def _debug_daily_bonus_state(sb: SB) -> str:
-    lines = []
+# ─────────────────────────────────────────────────────────────
+# Debugging
+# ─────────────────────────────────────────────────────────────
+
+def _debug_state(sb: SB) -> str:
+    lines: List[str] = []
 
     try:
-        lines.append(f"blocking_google_popup: {_has_blocking_google_popup(sb)}")
-        lines.append(f"get_coins_modal_open: {_is_get_coins_modal_open(sb)}")
+        lines.append(f"url: {sb.get_current_url()}")
+    except Exception:
+        pass
 
-        cards = _find_elements_css(sb, DAILY_BONUS_CSS_CARD)
-        lines.append(f"reward cards found: {len(cards)}")
+    lines.append(f"store_dialog_open: {_store_dialog_open(sb)}")
 
-        for idx, card in enumerate(cards, start=1):
-            try:
-                title = _get_card_title(sb, card)
-                buttons = card.find_elements(By.CSS_SELECTOR, "button")
-                button_texts = [_norm(_safe_element_text(sb, b)) for b in buttons]
+    cookie_popup = _find_matching_popup(sb, COOKIE_MARKERS)
+    ready_popup = _find_matching_popup(sb, DAILY_READY_MARKERS)
+    google_popup = _find_matching_popup(sb, GOOGLE_POPUP_MARKERS)
 
-                lines.append(
-                    f"card {idx}: title={title!r}, "
-                    f"buttons={button_texts!r}, "
-                    f"is_daily={_is_daily_bonus_card(sb, card)}"
-                )
-            except Exception as e:
-                lines.append(f"card {idx}: debug error={e}")
-    except Exception as e:
-        lines.append(f"debug error: {e}")
+    lines.append(f"cookie_popup: {cookie_popup is not None}")
+    lines.append(f"daily_ready_popup: {ready_popup is not None}")
+    lines.append(f"google_popup: {google_popup is not None}")
+    lines.append(f"get_coins_button: {_get_coins_button(sb) is not None}")
 
-    return "\n".join(lines[-10:])
+    cards = _find_css(sb, REWARD_CARD_CSS)
+    lines.append(f"reward_cards: {len(cards)}")
+
+    for index, card in enumerate(cards[:6], start=1):
+        try:
+            title = _reward_card_title(sb, card)
+            button_texts = []
+
+            for button in card.find_elements(By.TAG_NAME, "button"):
+                button_texts.append(_norm(_safe_text(sb, button)))
+
+            lines.append(
+                f"card_{index}: title={title!r}, buttons={button_texts!r}"
+            )
+        except Exception as error:
+            lines.append(f"card_{index}: debug_error={error}")
+
+    return "\n".join(lines)
 
 
-def _detect_claim_state(sb: SB) -> dict:
+def _appears_already_claimed(sb: SB) -> bool:
     text = _norm(_page_text(sb))
-
-    return {
-        "has_blocking_google_popup": _has_blocking_google_popup(sb),
-        "has_get_coins_modal": _is_get_coins_modal_open(sb),
-        "has_claim_free_rewards": "claim free rewards" in text,
-        "has_daily_bonus": "daily bonus" in text,
-        "has_google_grab": "google grab" in text,
-        "has_collect": "collect" in text,
-        "has_claimed_marker": any(marker in text for marker in CLAIMED_TEXT_MARKERS),
-        "url": sb.get_current_url() if hasattr(sb, "get_current_url") else "",
-    }
+    return any(marker in text for marker in CLAIMED_MARKERS)
 
 
-# ───────────────────────────────────────────────────────────
-# American Luck Main Flow
-# ───────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────
+# Main American Luck flow
+# ─────────────────────────────────────────────────────────────
 
-async def americanluck_uc(ctx, channel: discord.abc.Messageable):
-    await channel.send("Launching **American Luck** (UC)…")
+async def americanluck_uc(
+    ctx,
+    channel: discord.abc.Messageable,
+) -> None:
+    await channel.send("Launching **American Luck (UC)**…")
 
     creds = os.getenv("AMERICANLUCK")
 
     if not creds or ":" not in creds:
-        await channel.send("⚠️ AMERICANLUCK not set in `.env`.")
+        print(
+            "[American Luck][ERROR] AMERICANLUCK is missing from .env. "
+            "Expected email:password."
+        )
         return
 
     username, password = creds.split(":", 1)
 
-    sb = None
+    sb: Optional[SB] = None
 
     try:
         with SB(uc=True, headed=True) as sb:
-            # ── Step 1: open login page ──
+            # ── Step 1: login ──
+
             sb.uc_open_with_reconnect(LOGIN_URL, 8)
             sb.wait_for_ready_state_complete()
-
-            # ── Step 2: login ──
             sb.wait(1)
+
             sb.type("input[id='emailAddress']", username)
             sb.type("input[id='password']", password)
 
@@ -899,76 +1154,79 @@ async def americanluck_uc(ctx, channel: discord.abc.Messageable):
 
             sb.wait(1.5)
 
-            _force_click_xpath(
+            login_clicked = _click_xpath(
                 sb,
-                "/html/body/div[1]/div[2]/main/div/div/div/div[2]/form/div[4]/button",
+                LOGIN_BUTTON_XP,
                 timeout=10,
             )
 
-            sb.wait(6)
-            sb.wait_for_ready_state_complete()
+            if not login_clicked:
+                # Text-based login fallback.
+                login_xp = (
+                    "//button["
+                    "contains("
+                    f"translate(normalize-space(.),'{UPPER}','{LOWER}'),"
+                    "'login'"
+                    ") or contains("
+                    f"translate(normalize-space(.),'{UPPER}','{LOWER}'),"
+                    "'log in'"
+                    ")"
+                    "]"
+                )
 
-            # ── Step 3: close blocker popups after login ──
-            _close_blocking_popups(sb, max_rounds=5)
+                _click_xpath(sb, login_xp, timeout=4)
+
+            sb.wait(6)
 
             try:
-                sb.press_keys("body", "ESCAPE")
+                sb.wait_for_ready_state_complete()
             except Exception:
                 pass
 
-            sb.wait(1)
-            sb.wait_for_ready_state_complete()
+            # ── Step 2: verify lobby ──
 
-            # ── Step 4: verify lobby/login ──
             login_ok = False
 
             try:
-                sb.wait_for_element_visible(GET_COINS_BTN_XP, timeout=8)
-                login_ok = True
+                current_url = sb.get_current_url()
+                login_ok = current_url.startswith(LOBBY_URL)
             except Exception:
-                login_ok = False
+                pass
 
-            if not login_ok:
-                try:
-                    current_url = sb.get_current_url()
-                    if current_url.startswith(LOBBY_URL):
-                        login_ok = True
-                except Exception:
-                    pass
+            if not login_ok and _get_coins_button(sb) is not None:
+                login_ok = True
 
             if not login_ok:
                 await _send_shot(
                     sb,
                     channel,
                     "americanluck_login_failed.png",
-                    "[American Luck] Login failed or lobby did not load.",
+                    "[American Luck] Login failed or the lobby did not load.",
                 )
                 return
 
-            # ── Step 5: intelligently open Get Coins modal ──
-            opened = _open_get_coins_modal(sb)
+            # ── Step 3: enter store intelligently ──
 
-            if not opened:
-                debug = _debug_daily_bonus_state(sb)
+            store_opened = _open_coin_store(sb)
+
+            if not store_opened:
+                debug = _debug_state(sb)
 
                 await _send_shot(
                     sb,
                     channel,
-                    "americanluck_getcoins_missing.png",
-                    "[American Luck] Could not open **Get Coins** after popup cleanup.\n\n"
-                    f"```{debug[:1500]}```",
+                    "americanluck_store_blocked.png",
+                    "[American Luck] Could not enter the Coin Store after "
+                    "handling the cookie panel, Daily Bonus popup, Google popup, "
+                    "GET COINS button, and refresh fallbacks.\n\n"
+                    f"```text\n{debug[:1700]}\n```",
                 )
                 return
 
-            sb.wait_for_ready_state_complete()
             sb.wait(2)
 
-            # Important: do NOT close popups here unless the Google blocker exists.
-            # The Get Coins modal itself has a close button, so we avoid blind closing.
-            if _has_blocking_google_popup(sb):
-                _close_blocking_popups(sb, max_rounds=4)
+            # ── Step 4: claim only Daily Bonus ──
 
-            # ── Step 6: click ONLY Daily Bonus Collect ──
             collected = _click_daily_bonus_collect(sb)
 
             if not collected:
@@ -976,7 +1234,7 @@ async def americanluck_uc(ctx, channel: discord.abc.Messageable):
                 collected = _click_daily_bonus_collect(sb)
 
             if not collected:
-                _scroll_rewards_into_view(sb)
+                _scroll_store_to_rewards(sb)
                 sb.wait(1)
                 collected = _click_daily_bonus_collect(sb)
 
@@ -991,40 +1249,43 @@ async def americanluck_uc(ctx, channel: discord.abc.Messageable):
                 )
                 return
 
-            # ── Step 7: failure/debug ──
-            state = _detect_claim_state(sb)
-            debug = _debug_daily_bonus_state(sb)
-
-            if state["has_claimed_marker"]:
+            if _appears_already_claimed(sb):
                 await _send_shot(
                     sb,
                     channel,
                     "americanluck_already_claimed.png",
-                    "[American Luck] Daily Bonus appears to already be claimed.",
+                    "[American Luck] The Daily Bonus appears to already be claimed.",
                 )
                 return
+
+            debug = _debug_state(sb)
 
             await _send_shot(
                 sb,
                 channel,
-                "americanluck_daily_collect_missing.png",
-                "[American Luck] Could not click **Daily Bonus → Collect**.\n"
-                "I refused to click Google Grab, Connect with Google, More Coins, or any non-Daily Bonus button.\n\n"
-                f"```{debug[:1500]}```",
+                "americanluck_collect_failed.png",
+                "[American Luck] The Coin Store opened, but I could not click "
+                "**Daily Bonus → Collect**. I refused all non-Daily Bonus "
+                "buttons.\n\n"
+                f"```text\n{debug[:1700]}\n```",
             )
 
-    except Exception as e:
+    except Exception as error:
         try:
             if sb is not None:
                 await _send_shot(
                     sb,
                     channel,
                     "americanluck_error.png",
-                    f"⚠️ American Luck crashed: `{e}`",
+                    f"⚠️ American Luck crashed: `{error}`",
                 )
             else:
-                await channel.send(
-                    f"⚠️ American Luck crashed before browser started: `{e}`"
+                print(
+                    "[American Luck][ERROR] Crashed before the browser "
+                    f"started: {error}"
                 )
-        except Exception:
-            pass
+        except Exception as reporting_error:
+            print(
+                "[American Luck][ERROR] Failed while reporting crash: "
+                f"{reporting_error}"
+            )

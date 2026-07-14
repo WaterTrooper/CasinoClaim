@@ -6,6 +6,7 @@
 import os
 import re
 import tempfile
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import discord
@@ -30,6 +31,40 @@ CLAIMED_MARKERS = (
     "ALREADY CLAIMED",
     "SEE YOU TOMORROW",
     "COME BACK TOMORROW",
+)
+
+# Zula's current successful-claim popup does not necessarily say "claimed".
+# The popup shown after a real claim contains:
+#   CONGRATULATIONS! / 10,000 / 1.00 / START PLAYING
+# These markers are evaluated as combinations, not as single loose matches.
+CLAIM_SUCCESS_TITLE_MARKERS = (
+    "CONGRATULATIONS",
+    "CONGRATS",
+)
+
+CLAIM_SUCCESS_ACTION_MARKERS = (
+    "START PLAYING",
+    "PLAY NOW",
+    "CONTINUE",
+)
+
+CLAIM_SUCCESS_GENERIC_MARKERS = (
+    "CLAIM SUCCESSFUL",
+    "SUCCESSFULLY CLAIMED",
+    "REWARD CLAIMED",
+    "BONUS CLAIMED",
+    "REWARD ADDED",
+    "BONUS ADDED",
+    "YOU RECEIVED",
+    "YOU'VE RECEIVED",
+)
+
+CLAIM_SUCCESS_REWARD_MARKERS = (
+    "10,000",
+    "10000",
+    "1.00",
+    "GOLD COINS",
+    "SWEEPS COINS",
 )
 
 CHECKOUT_MARKERS = (
@@ -367,6 +402,351 @@ def _page_text(sb: SB) -> str:
     )
 
 
+
+def _visible_page_text(sb: SB) -> str:
+    """
+    Returns visible rendered text only.
+
+    This is used for post-click success detection so hidden template text does
+    not accidentally count as a successful claim.
+    """
+    value = _safe_js(
+        sb,
+        """
+        if (!document.body) return "";
+        return document.body.innerText || "";
+        """,
+        default="",
+    )
+    return _norm(value)
+
+
+def _visible_modal_candidates(sb: SB) -> List[Dict[str, Any]]:
+    """
+    Scans visible dialogs/popups/modals and returns their text plus button text.
+
+    Zula changes wrapper indexes often, so this intentionally avoids absolute
+    modal XPaths. It also catches the successful "CONGRATULATIONS /
+    START PLAYING" popup shown after the daily reward is collected.
+    """
+    result = _safe_js(
+        sb,
+        """
+        const visible = (el) => {
+            if (!el) return false;
+            const s = window.getComputedStyle(el);
+            const r = el.getBoundingClientRect();
+            return s.display !== "none"
+                && s.visibility !== "hidden"
+                && s.opacity !== "0"
+                && r.width > 0
+                && r.height > 0;
+        };
+
+        const selectors = [
+            "[role='dialog']",
+            "[aria-modal='true']",
+            "[class*='modal']",
+            "[class*='Modal']",
+            "[class*='dialog']",
+            "[class*='Dialog']",
+            "[class*='popup']",
+            "[class*='Popup']"
+        ];
+
+        const seen = new Set();
+        const out = [];
+
+        for (const selector of selectors) {
+            for (const el of Array.from(document.querySelectorAll(selector))) {
+                if (!visible(el) || seen.has(el)) continue;
+
+                const text = (el.innerText || el.textContent || "").trim();
+                if (!text) continue;
+
+                // Skip giant app/root containers accidentally matching a class.
+                if (text.length > 4000) continue;
+
+                seen.add(el);
+
+                const buttons = Array.from(
+                    el.querySelectorAll(
+                        "button, [role='button'], a, input[type='button'], input[type='submit']"
+                    )
+                )
+                    .filter(visible)
+                    .map((btn) => (
+                        btn.innerText
+                        || btn.textContent
+                        || btn.value
+                        || btn.getAttribute("aria-label")
+                        || btn.getAttribute("title")
+                        || ""
+                    ).trim())
+                    .filter(Boolean);
+
+                const rect = el.getBoundingClientRect();
+                const style = window.getComputedStyle(el);
+
+                out.push({
+                    text,
+                    buttons,
+                    role: el.getAttribute("role") || "",
+                    ariaModal: el.getAttribute("aria-modal") || "",
+                    classes: el.className ? String(el.className) : "",
+                    position: style.position || "",
+                    zIndex: style.zIndex || "",
+                    area: Math.round(rect.width * rect.height)
+                });
+            }
+        }
+
+        return out;
+        """,
+        default=[],
+    )
+
+    return result if isinstance(result, list) else []
+
+
+def _modal_signature(modal: Dict[str, Any]) -> str:
+    """
+    Stable-enough signature used to distinguish a new post-click popup from
+    anything that was already on screen before the claim click.
+    """
+    text = _up(modal.get("text", ""))
+    buttons = _up(" ".join(modal.get("buttons", []) or []))
+    return _short(f"{text} || {buttons}", 700)
+
+
+def _success_modal_signatures(sb: SB) -> Tuple[str, ...]:
+    signatures = []
+    for modal in _visible_modal_candidates(sb):
+        signature = _modal_signature(modal)
+        if signature:
+            signatures.append(signature)
+    return tuple(signatures)
+
+
+def _claim_success_evidence(
+    sb: SB,
+    previous_signatures: Tuple[str, ...] = (),
+    pre_click_visible_text: str = "",
+    verbose: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """
+    Detects a real successful-claim confirmation.
+
+    Strong accepted combinations:
+    1) A NEW visible modal containing CONGRATULATIONS + START PLAYING.
+    2) A NEW visible modal containing a generic success phrase + a success action.
+    3) A NEW visible modal containing CONGRATULATIONS + both reward amounts
+       (10,000 and 1.00), even if the button text is represented graphically.
+    4) The same combinations in visible page text when the site does not expose
+       a recognizable dialog wrapper.
+
+    A lone "Congratulations" or lone "Start Playing" is never enough.
+    Checkout/payment markers always invalidate the candidate.
+    """
+    previous = set(previous_signatures or ())
+    best: Optional[Dict[str, Any]] = None
+
+    for modal in _visible_modal_candidates(sb):
+        modal_text = _up(modal.get("text", ""))
+        button_text = _up(" ".join(modal.get("buttons", []) or []))
+        combined = _up(f"{modal_text} {button_text}")
+        signature = _modal_signature(modal)
+        is_new = signature not in previous
+
+        title_hit = _first_marker(combined, CLAIM_SUCCESS_TITLE_MARKERS)
+        action_hit = _first_marker(combined, CLAIM_SUCCESS_ACTION_MARKERS)
+        generic_hit = _first_marker(combined, CLAIM_SUCCESS_GENERIC_MARKERS)
+
+        has_10000 = "10,000" in combined or re.search(r"(?<!\d)10000(?!\d)", combined) is not None
+        has_100 = re.search(r"(?<!\d)1(?:[.,]00)(?!\d)", combined) is not None
+        has_reward_word = any(
+            marker in combined
+            for marker in ("GOLD COINS", "SWEEPS COINS", " GC", " SC", "AND")
+        )
+
+        score = 0
+        if title_hit:
+            score += 160
+        if action_hit:
+            score += 140
+        if generic_hit:
+            score += 180
+        if has_10000:
+            score += 60
+        if has_100:
+            score += 60
+        if has_reward_word:
+            score += 25
+        if is_new:
+            score += 80
+        if _contains_any(combined, CHECKOUT_MARKERS):
+            score -= 500
+        if _contains_any(combined, BAD_CONTEXT_MARKERS):
+            score -= 300
+
+        strong_combo = (
+            (bool(title_hit) and bool(action_hit))
+            or (bool(generic_hit) and bool(action_hit))
+            or (bool(title_hit) and has_10000 and has_100)
+        )
+
+        # When previous_signatures were supplied, require this popup to be new.
+        matched = strong_combo and (not previous or is_new) and score >= 300
+
+        if verbose:
+            print(
+                "[Zula] Success modal candidate: "
+                f"score={score} new={is_new} matched={matched} "
+                f"title={title_hit or '-'} action={action_hit or '-'} "
+                f"generic={generic_hit or '-'} "
+                f"text='{_short(combined, 180)}'"
+            )
+
+        if matched:
+            candidate = {
+                "matched": True,
+                "source": "new_success_modal",
+                "score": score,
+                "evidence": _short(combined, 220),
+                "signature": signature,
+            }
+
+            if best is None or score > int(best.get("score", 0)):
+                best = candidate
+
+    if best:
+        return best
+
+    # Fallback: sometimes the wrapper has no modal/dialog-ish class, but the
+    # visible document still contains the exact success popup text.
+    visible_text = _up(_visible_page_text(sb))
+    before_text = _up(pre_click_visible_text)
+
+    title_hit = _first_marker(visible_text, CLAIM_SUCCESS_TITLE_MARKERS)
+    action_hit = _first_marker(visible_text, CLAIM_SUCCESS_ACTION_MARKERS)
+    generic_hit = _first_marker(visible_text, CLAIM_SUCCESS_GENERIC_MARKERS)
+    has_10000 = "10,000" in visible_text or re.search(r"(?<!\d)10000(?!\d)", visible_text) is not None
+    has_100 = re.search(r"(?<!\d)1(?:[.,]00)(?!\d)", visible_text) is not None
+
+    before_had_combo = (
+        (
+            _first_marker(before_text, CLAIM_SUCCESS_TITLE_MARKERS)
+            and _first_marker(before_text, CLAIM_SUCCESS_ACTION_MARKERS)
+        )
+        or (
+            _first_marker(before_text, CLAIM_SUCCESS_GENERIC_MARKERS)
+            and _first_marker(before_text, CLAIM_SUCCESS_ACTION_MARKERS)
+        )
+        or (
+            _first_marker(before_text, CLAIM_SUCCESS_TITLE_MARKERS)
+            and ("10,000" in before_text or "10000" in before_text)
+            and re.search(r"(?<!\d)1(?:[.,]00)(?!\d)", before_text) is not None
+        )
+    )
+
+    strong_page_combo = (
+        (bool(title_hit) and bool(action_hit))
+        or (bool(generic_hit) and bool(action_hit))
+        or (bool(title_hit) and has_10000 and has_100)
+    )
+
+    if (
+        strong_page_combo
+        and not before_had_combo
+        and not _contains_any(visible_text, CHECKOUT_MARKERS)
+        and not _contains_any(visible_text, BAD_CONTEXT_MARKERS)
+    ):
+        evidence_parts = [
+            title_hit,
+            generic_hit,
+            action_hit,
+            "10,000" if has_10000 else "",
+            "1.00" if has_100 else "",
+        ]
+
+        return {
+            "matched": True,
+            "source": "visible_text_success_combo",
+            "score": 320,
+            "evidence": " + ".join(part for part in evidence_parts if part),
+            "signature": "",
+        }
+
+    return None
+
+
+def _daily_claim_snapshot(sb: SB) -> Dict[str, Any]:
+    """
+    Captures the daily reward card before/after a click for additional state
+    diagnostics without changing the candidate-based click strategy.
+    """
+    pkg = _daily_package(sb, verbose=False)
+
+    if not pkg:
+        return {
+            "found": False,
+            "text": "",
+            "claimedMarker": "",
+            "enabledClaimButtons": (),
+        }
+
+    enabled_claim_buttons = []
+
+    for btn in pkg.get("buttons", []):
+        if btn.get("disabled"):
+            continue
+
+        btn_text = _up(
+            " ".join(
+                [
+                    btn.get("text", ""),
+                    btn.get("aria", ""),
+                    btn.get("title", ""),
+                ]
+            )
+        )
+
+        if "COLLECT" in btn_text or "CLAIM" in btn_text:
+            enabled_claim_buttons.append(btn_text)
+
+    pkg_text = _norm(pkg.get("text", ""))
+
+    return {
+        "found": True,
+        "text": pkg_text,
+        "claimedMarker": _first_marker(pkg_text, CLAIMED_MARKERS),
+        "enabledClaimButtons": tuple(enabled_claim_buttons),
+    }
+
+
+def _daily_transition_evidence(
+    before: Dict[str, Any],
+    after: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """
+    Secondary card-level evidence.
+
+    This is intentionally conservative: button disappearance by itself does
+    not count. The after-state must also contain a known claimed/tomorrow marker.
+    """
+    claimed_marker = after.get("claimedMarker", "")
+
+    if claimed_marker:
+        return {
+            "matched": True,
+            "source": "daily_card_transition",
+            "score": 300,
+            "evidence": claimed_marker,
+        }
+
+    return None
+
+
 def _reward_packages(sb: SB) -> List[Dict[str, Any]]:
     """
     Finds Zula coin-store reward packages and tags buttons with temporary candidate IDs.
@@ -552,18 +932,27 @@ def _daily_package(sb: SB, verbose: bool = False) -> Optional[Dict[str, Any]]:
     return best if best.get("_score", 0) > 0 else None
 
 
-def _zula_state(sb: SB, verbose: bool = False) -> Dict[str, str]:
+def _zula_state(
+    sb: SB,
+    verbose: bool = False,
+    allow_claim_success: bool = False,
+    previous_success_signatures: Tuple[str, ...] = (),
+    pre_click_visible_text: str = "",
+) -> Dict[str, str]:
     """
     Returns:
     - checkout
+    - claim_success
     - daily_claimed
     - rewards_modal
     - login
     - unknown
+
+    claim_success is only evaluated in the post-click phase.
     """
     page_text = _page_text(sb)
 
-    # Checkout wins first because this is the exact false-positive page.
+    # Checkout wins first because payment/checkout must never be counted as a claim.
     checkout_hit = _first_marker(page_text, CHECKOUT_MARKERS)
     if checkout_hit:
         return {
@@ -571,6 +960,21 @@ def _zula_state(sb: SB, verbose: bool = False) -> Dict[str, str]:
             "reason": "Checkout/payment page detected",
             "evidence": checkout_hit,
         }
+
+    if allow_claim_success:
+        success = _claim_success_evidence(
+            sb,
+            previous_signatures=previous_success_signatures,
+            pre_click_visible_text=pre_click_visible_text,
+            verbose=verbose,
+        )
+
+        if success:
+            return {
+                "status": "claim_success",
+                "reason": "Successful daily-claim confirmation popup/text detected",
+                "evidence": str(success.get("evidence", "")),
+            }
 
     pkg = _daily_package(sb, verbose=verbose)
 
@@ -617,12 +1021,37 @@ def _zula_state(sb: SB, verbose: bool = False) -> Dict[str, str]:
     }
 
 
-def _wait_for_state(sb: SB, wanted: Tuple[str, ...], timeout: float = 8, step: float = 1) -> Dict[str, str]:
-    loops = max(1, int(timeout / step))
-    last = _zula_state(sb, verbose=True)
+def _wait_for_state(
+    sb: SB,
+    wanted: Tuple[str, ...],
+    timeout: float = 8,
+    step: float = 1,
+    allow_claim_success: bool = False,
+    previous_success_signatures: Tuple[str, ...] = (),
+    pre_click_visible_text: str = "",
+) -> Dict[str, str]:
+    """
+    Polls state until one of the wanted states appears.
 
-    for _ in range(loops):
-        last = _zula_state(sb, verbose=True)
+    The first scan happens immediately so short-lived success popups are not
+    missed. Post-click callers can enable claim_success detection and provide
+    the pre-click modal/text snapshots.
+    """
+    deadline = time.monotonic() + max(0.1, timeout)
+    last: Dict[str, str] = {
+        "status": "unknown",
+        "reason": "State polling has not started",
+        "evidence": "",
+    }
+
+    while True:
+        last = _zula_state(
+            sb,
+            verbose=True,
+            allow_claim_success=allow_claim_success,
+            previous_success_signatures=previous_success_signatures,
+            pre_click_visible_text=pre_click_visible_text,
+        )
 
         print(
             f"[Zula] State={last['status']} "
@@ -633,9 +1062,13 @@ def _wait_for_state(sb: SB, wanted: Tuple[str, ...], timeout: float = 8, step: f
         if last["status"] in wanted:
             return last
 
-        sb.wait(step)
+        remaining = deadline - time.monotonic()
 
-    return last
+        if remaining <= 0:
+            return last
+
+        sb.wait(min(step, remaining))
+
 
 
 def _find_daily_claim_candidate(sb: SB) -> Optional[Dict[str, Any]]:
@@ -782,7 +1215,10 @@ async def zula_uc(ctx, channel: discord.abc.Messageable):
     - scan for CHECKOUT/payment false-positive page
     - find the daily bonus package
     - click only that package's Collect/Claim candidate
-    - verify claimed text before sending "Zula Daily Bonus Claimed!"
+    - verify either claimed/tomorrow text OR the new
+      CONGRATULATIONS + START PLAYING success popup
+    - compare post-click popup/text against pre-click state before sending
+      "Zula Daily Bonus Claimed!"
     """
     await channel.send("Launching **Zula** (UC)…")
 
@@ -950,6 +1386,19 @@ async def zula_uc(ctx, channel: discord.abc.Messageable):
 
             print(f"[Zula] Selected claim candidate: {candidate}")
 
+            # Capture pre-click state so an old/open popup cannot be mistaken
+            # for the result of this specific claim click.
+            pre_success_signatures = _success_modal_signatures(sb)
+            pre_click_visible_text = _visible_page_text(sb)
+            pre_daily_snapshot = _daily_claim_snapshot(sb)
+
+            print(
+                "[Zula] Pre-click verification snapshot: "
+                f"modal_signatures={len(pre_success_signatures)} "
+                f"daily_found={pre_daily_snapshot.get('found')} "
+                f"claim_buttons={len(pre_daily_snapshot.get('enabledClaimButtons', ()))}"
+            )
+
             # 8) Click only the selected daily reward candidate
             clicked = _click_candidate(sb, candidate.get("candidateId", ""))
 
@@ -963,14 +1412,23 @@ async def zula_uc(ctx, channel: discord.abc.Messageable):
                 )
                 return
 
-            sb.wait(3)
+            # Do not sleep for several seconds before checking. Scan quickly so
+            # even a short-lived confirmation popup can be captured.
+            sb.wait(0.35)
 
-            # 9) Verify after click. This prevents the screenshot false-positive.
+            # 9) Verify after click. Accepted success states are:
+            #    - exact/contains-text Congratulations + Start Playing popup
+            #    - generic success popup combinations
+            #    - daily card/page changes to claimed/tomorrow text
+            # Checkout still wins and is never counted.
             final_state = _wait_for_state(
                 sb,
-                wanted=("daily_claimed", "checkout"),
-                timeout=10,
-                step=1,
+                wanted=("claim_success", "daily_claimed", "checkout"),
+                timeout=12,
+                step=0.5,
+                allow_claim_success=True,
+                previous_success_signatures=pre_success_signatures,
+                pre_click_visible_text=pre_click_visible_text,
             )
 
             if final_state["status"] == "checkout":
@@ -983,7 +1441,7 @@ async def zula_uc(ctx, channel: discord.abc.Messageable):
                 )
                 return
 
-            if final_state["status"] == "daily_claimed":
+            if final_state["status"] in ("claim_success", "daily_claimed"):
                 print(f"[Zula] Claimed successfully and verified: {final_state}")
                 await _send_post_claim(
                     sb,
@@ -993,11 +1451,51 @@ async def zula_uc(ctx, channel: discord.abc.Messageable):
                 )
                 return
 
-            print(f"[Zula] Claim click was not verified. Final state: {final_state}")
+            # Final direct contains-text/modal check in case state polling ended
+            # between a DOM update and the reward-card refresh.
+            final_success = _claim_success_evidence(
+                sb,
+                previous_signatures=pre_success_signatures,
+                pre_click_visible_text=pre_click_visible_text,
+                verbose=True,
+            )
+
+            if final_success:
+                print(f"[Zula] Claimed successfully via final success check: {final_success}")
+                await _send_post_claim(
+                    sb,
+                    channel,
+                    "zula_claimed.png",
+                    "Zula Daily Bonus Claimed!",
+                )
+                return
+
+            post_daily_snapshot = _daily_claim_snapshot(sb)
+            transition = _daily_transition_evidence(
+                pre_daily_snapshot,
+                post_daily_snapshot,
+            )
+
+            if transition:
+                print(f"[Zula] Claimed successfully via daily-card transition: {transition}")
+                await _send_post_claim(
+                    sb,
+                    channel,
+                    "zula_claimed.png",
+                    "Zula Daily Bonus Claimed!",
+                )
+                return
+
+            print(
+                "[Zula] Claim click was not verified. "
+                f"Final state={final_state}; "
+                f"pre_daily={pre_daily_snapshot}; "
+                f"post_daily={post_daily_snapshot}"
+            )
             await _send_status_shot(
                 sb,
                 channel,
-                "[Zula] Claim click happened, but the page did not confirm a daily claim. Not marking as claimed.",
+                "[Zula] Claim click happened, but no success popup or claimed-state text was found. Not marking as claimed.",
                 "zula_unverified",
             )
             return
