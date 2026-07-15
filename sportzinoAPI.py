@@ -40,6 +40,8 @@ PASSWORD_LOCATORS: Tuple[str, ...] = (
     "/html/body/div[1]/div/main/div/div[3]/div/form/div[2]/div/input",
 )
 
+
+
 SUBMIT_LOCATORS: Tuple[str, ...] = (
     "button[data-testid='login-submit-button']",
     "button[type='submit']",
