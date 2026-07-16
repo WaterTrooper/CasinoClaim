@@ -1,7 +1,7 @@
 # Drake Hooks + WaterTrooper
 # Casino Claim 3
 # Sportzino API (SeleniumBase UC)
-# Robust login detection, cookie-consent handling, and conservative claim verification.
+# Exact-ID login, non-scrolling cookie handling, and conservative claim verification.
 
 import os
 import re
@@ -21,31 +21,39 @@ LOGIN_URL = "https://sportzino.com/login"
 HOME_URL = "https://sportzino.com/"
 
 EMAIL_LOCATORS: Tuple[str, ...] = (
-    # Current stable attributes visible in DevTools.
+    # Exact current Sportzino login field from the supplied DevTools markup.
+    "#emailAddress",
+    "input#emailAddress",
     "input[data-testid='login-email-input']",
     "input[name='username']",
     "input[autocomplete='username']",
     "input[placeholder='@email']",
     "input[type='email']",
-    # User-provided current absolute XPath.
+    # Absolute XPath is retained only as a final fallback.
     "/html/body/div[1]/div/main/div/div[3]/div/form/div[1]/div/input",
 )
 
 PASSWORD_LOCATORS: Tuple[str, ...] = (
+    # Exact current Sportzino login field from the supplied DevTools markup.
+    "#password",
+    "input#password",
     "input[data-testid='login-password-input']",
     "input[name='password']",
     "input[autocomplete='current-password']",
     "input[type='password']",
-    # User-provided current absolute XPath.
+    # Absolute XPath is retained only as a final fallback.
     "/html/body/div[1]/div/main/div/div[3]/div/form/div[2]/div/input",
 )
 
 SUBMIT_LOCATORS: Tuple[str, ...] = (
+    # Scope the click to the actual login form so another page button cannot win.
+    "form.login-form .login-form-login-button-container button",
+    ".login-form-login-button-container button",
+    "form.login-form button[type='submit']",
+    "form.login-form button[data-testid='login-submit-button']",
     "button[data-testid='login-submit-button']",
-    "button[type='submit']",
-    "//button[normalize-space()='Log In']",
-    "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')]",
-    "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]",
+    "//form[contains(@class,'login-form')]//button[normalize-space()='Log In']",
+    "//form[contains(@class,'login-form')]//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'log in')]",
 )
 
 COOKIE_ACCEPT_LOCATORS: Tuple[str, ...] = (
@@ -63,11 +71,6 @@ COOKIE_ACCEPT_LOCATORS: Tuple[str, ...] = (
     "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'allow all')]",
 )
 
-COOKIE_MANAGE_LOCATORS: Tuple[str, ...] = (
-    "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'manage cookies')]",
-    "//a[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'manage cookies')]",
-    "button[data-testid='manage-cookies']",
-)
 
 CLAIMED_MARKERS: Tuple[str, ...] = (
     "TODAY'S BONUS IS CLAIMED",
@@ -248,15 +251,26 @@ def _is_authenticated(sb: SB) -> bool:
     upper = _up(snapshot["text"])
     url_upper = snapshot["url"].upper()
 
-    if _is_login_page(sb):
+    # Visible login controls always override URL/text guesses.
+    email_visible = _first_visible_locator(sb, EMAIL_LOCATORS, timeout_each=0.15) is not None
+    password_visible = _first_visible_locator(sb, PASSWORD_LOCATORS, timeout_each=0.15) is not None
+    if email_visible or password_visible:
         return False
 
-    if any(token in url_upper for token in ("/AUTH/CALLBACK", "/CONNECT/AUTHORIZE")):
+    if any(
+        token in url_upper
+        for token in (
+            "/LOGIN",
+            "/AUTH/CALLBACK",
+            "/CONNECT/AUTHORIZE",
+            "/ERROR",
+            "/ACCESSDENIED",
+        )
+    ):
         return False
 
     authenticated_markers = (
         "COIN STORE",
-        "FREE COINS",
         "GET COINS",
         "REWARDS",
         "MY ACCOUNT",
@@ -265,9 +279,12 @@ def _is_authenticated(sb: SB) -> bool:
         "WALLET",
     )
 
-    # The redirect away from /login and disappearance of both login inputs is
-    # enough; marker text is an additional positive signal.
-    return "/LOGIN" not in url_upper or any(marker in upper for marker in authenticated_markers)
+    if any(marker in upper for marker in authenticated_markers):
+        return True
+
+    # Sportzino normally redirects to the lobby after a successful login. A
+    # non-login Sportzino URL with no visible login fields is therefore valid.
+    return "SPORTZINO.COM" in url_upper and "/LOGIN" not in url_upper
 
 
 # ───────────────────────────────────────────────────────────
@@ -345,41 +362,70 @@ def _fill_input(
     value: str,
     field_name: str,
 ) -> Optional[str]:
-    """Find, clear, and fill the first visible matching input."""
+    """Fill the first visible input without scrolling the page."""
     for locator in locators:
         try:
-            sb.wait_for_element_visible(locator, timeout=3)
+            sb.wait_for_element_visible(locator, timeout=4)
+            element = sb.find_element(locator)
 
-            try:
-                sb.click(locator)
-            except Exception:
-                pass
-
-            try:
-                sb.press_keys(locator, "CTRL+A")
-                sb.press_keys(locator, "BACKSPACE")
-            except Exception:
-                try:
-                    sb.clear(locator)
-                except Exception:
-                    pass
-
-            sb.type(locator, value)
-
-            # Confirm that the browser actually received a value.
+            # React/Sentry controlled inputs can ignore a plain JS assignment.
+            # Use the native HTMLInputElement setter and dispatch the same events
+            # a real user action generates.
             actual = _safe_js(
                 sb,
-                "return arguments[0] ? (arguments[0].value || '') : '';",
-                sb.find_element(locator),
+                r"""
+                const el = arguments[0];
+                const value = arguments[1];
+                if (!el) return '';
+
+                el.focus({preventScroll: true});
+                const descriptor = Object.getOwnPropertyDescriptor(
+                    window.HTMLInputElement.prototype,
+                    'value'
+                );
+                descriptor.set.call(el, '');
+                el.dispatchEvent(new Event('input', {bubbles: true}));
+                descriptor.set.call(el, value);
+                el.dispatchEvent(new InputEvent('input', {
+                    bubbles: true,
+                    inputType: 'insertText',
+                    data: value
+                }));
+                el.dispatchEvent(new Event('change', {bubbles: true}));
+                el.blur();
+                return el.value || '';
+                """,
+                element,
+                value,
                 default="",
             )
 
-            if _norm(actual):
-                print(f"[Sportzino] Filled {field_name} using: {locator}")
+            # Selenium keystrokes are a fallback if the framework rewrites the
+            # value after the native setter/events above.
+            if actual != value:
+                try:
+                    element.click()
+                    element.clear()
+                    element.send_keys(value)
+                except Exception:
+                    pass
+
+                actual = _safe_js(
+                    sb,
+                    "return arguments[0] ? (arguments[0].value || '') : '';",
+                    element,
+                    default="",
+                )
+
+            if actual == value:
+                print(
+                    f"[Sportzino] Filled {field_name} using {locator} "
+                    f"({len(value)} characters)."
+                )
                 return locator
 
-        except Exception:
-            continue
+        except Exception as exc:
+            print(f"[Sportzino] {field_name} locator failed ({locator}): {exc}")
 
     print(f"[Sportzino] Could not fill {field_name} using any known locator.")
     return None
@@ -390,6 +436,7 @@ def _fill_input(
 # ───────────────────────────────────────────────────────────
 
 def _js_click_cookie_accept(sb: SB) -> bool:
+    """Click Accept only inside a genuine cookie dialog/banner overlay."""
     return bool(
         _safe_js(
             sb,
@@ -402,7 +449,9 @@ def _js_click_cookie_accept(sb: SB) -> bool:
                     && style.visibility !== 'hidden'
                     && style.opacity !== '0'
                     && rect.width > 0
-                    && rect.height > 0;
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight;
             };
 
             const normalize = (value) => (value || '')
@@ -410,36 +459,81 @@ def _js_click_cookie_accept(sb: SB) -> bool:
                 .trim()
                 .toLowerCase();
 
+            const isOverlay = (node) => {
+                if (!visible(node)) return false;
+                const style = window.getComputedStyle(node);
+                const rect = node.getBoundingClientRect();
+                const role = normalize(node.getAttribute('role'));
+                const cookieText = normalize([
+                    node.innerText,
+                    node.textContent,
+                    node.getAttribute('aria-label'),
+                    node.id,
+                    node.className
+                ].join(' '));
+
+                const mentionsCookies =
+                    cookieText.includes('cookie') ||
+                    cookieText.includes('privacy preferences') ||
+                    cookieText.includes('we value your privacy');
+
+                const positionedOverlay =
+                    style.position === 'fixed' ||
+                    style.position === 'sticky' ||
+                    role === 'dialog' ||
+                    role === 'alertdialog';
+
+                const overlapsViewport =
+                    rect.bottom > 0 &&
+                    rect.top < window.innerHeight &&
+                    rect.right > 0 &&
+                    rect.left < window.innerWidth;
+
+                return mentionsCookies && positionedOverlay && overlapsViewport;
+            };
+
+            const roots = Array.from(new Set([
+                ...document.querySelectorAll(
+                    '#onetrust-banner-sdk, #onetrust-pc-sdk, ' +
+                    '#CybotCookiebotDialog, .cky-consent-container, ' +
+                    '.osano-cm-window, [role="dialog"], [role="alertdialog"], ' +
+                    '[data-testid*="cookie" i], [id*="cookie" i], [class*="cookie" i]'
+                ),
+                ...Array.from(document.querySelectorAll('div, section, aside')).filter(isOverlay)
+            ])).filter(isOverlay);
+
             const preferred = [
                 'accept all',
                 'allow all',
                 'accept cookies',
-                'i agree',
                 'agree and continue',
                 'save and accept',
+                'i agree',
                 'accept'
             ];
 
-            const elements = Array.from(
-                document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]')
-            ).filter(visible);
+            for (const root of roots) {
+                // Buttons only. Never click a footer/link named Manage Cookies.
+                const controls = Array.from(root.querySelectorAll(
+                    'button, input[type="button"], input[type="submit"], [role="button"]'
+                )).filter(visible);
 
-            for (const phrase of preferred) {
-                const match = elements.find((el) => {
-                    const text = normalize([
-                        el.innerText,
-                        el.textContent,
-                        el.value,
-                        el.getAttribute('aria-label'),
-                        el.getAttribute('title')
-                    ].join(' '));
-                    return text === phrase || text.includes(phrase);
-                });
+                for (const phrase of preferred) {
+                    const match = controls.find((el) => {
+                        const text = normalize([
+                            el.innerText,
+                            el.textContent,
+                            el.value,
+                            el.getAttribute('aria-label'),
+                            el.getAttribute('title')
+                        ].join(' '));
+                        return text === phrase || text.startsWith(`${phrase} `);
+                    });
 
-                if (match) {
-                    match.scrollIntoView({block: 'center'});
-                    match.click();
-                    return true;
+                    if (match) {
+                        match.click();
+                        return true;
+                    }
                 }
             }
 
@@ -451,51 +545,71 @@ def _js_click_cookie_accept(sb: SB) -> bool:
 
 
 def _neutralize_cookie_overlay(sb: SB) -> bool:
-    """
-    Last-resort visual/interception fallback.
-
-    This does not pretend consent was accepted. It only disables a fixed cookie
-    overlay after real Accept/Allow attempts fail, so the login controls remain
-    clickable.
-    """
+    """Hide only a fixed/sticky cookie overlay that blocks the login form."""
     return bool(
         _safe_js(
             sb,
             r"""
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+                return style.display !== 'none'
+                    && style.visibility !== 'hidden'
+                    && rect.width > 0
+                    && rect.height > 0
+                    && rect.bottom > 0
+                    && rect.top < window.innerHeight;
+            };
+
             const normalize = (value) => (value || '')
                 .replace(/\s+/g, ' ')
                 .trim()
                 .toLowerCase();
 
-            const nodes = Array.from(document.querySelectorAll('div, section, aside'));
             let changed = false;
+            const nodes = Array.from(document.querySelectorAll(
+                '#onetrust-banner-sdk, #onetrust-pc-sdk, #CybotCookiebotDialog, ' +
+                '.cky-consent-container, .osano-cm-window, [role="dialog"], ' +
+                '[role="alertdialog"], div, section, aside'
+            ));
 
             for (const node of nodes) {
-                const text = normalize(node.innerText || node.textContent || '');
-                if (!text) continue;
-
-                const looksLikeCookie =
-                    text.includes('we value your privacy') ||
-                    text.includes('manage cookies') ||
-                    text.includes('privacy policy') && text.includes('cookies');
-
-                if (!looksLikeCookie) continue;
+                if (!visible(node)) continue;
 
                 const style = window.getComputedStyle(node);
-                const rect = node.getBoundingClientRect();
+                const role = normalize(node.getAttribute('role'));
+                const text = normalize([
+                    node.innerText,
+                    node.textContent,
+                    node.getAttribute('aria-label'),
+                    node.id,
+                    node.className
+                ].join(' '));
+
+                const looksLikeCookie =
+                    text.includes('cookie') ||
+                    text.includes('privacy preferences') ||
+                    text.includes('we value your privacy');
+
                 const overlayLike =
                     style.position === 'fixed' ||
                     style.position === 'sticky' ||
-                    Number(style.zIndex || 0) > 10 ||
-                    (rect.width > 250 && rect.height > 100);
+                    role === 'dialog' ||
+                    role === 'alertdialog';
 
-                if (overlayLike) {
+                if (looksLikeCookie && overlayLike) {
                     node.style.setProperty('display', 'none', 'important');
+                    node.style.setProperty('visibility', 'hidden', 'important');
                     node.style.setProperty('pointer-events', 'none', 'important');
                     changed = true;
                 }
             }
 
+            if (changed) {
+                document.documentElement.style.removeProperty('overflow');
+                document.body && document.body.style.removeProperty('overflow');
+            }
             return changed;
             """,
             default=False,
@@ -504,36 +618,17 @@ def _neutralize_cookie_overlay(sb: SB) -> bool:
 
 
 def _handle_cookie_consent(sb: SB) -> bool:
-    """Accept the cookie banner when possible; neutralize it only as fallback."""
-    accepted = _try_click_any(sb, COOKIE_ACCEPT_LOCATORS, timeout_each=1.5)
-
-    if not accepted:
-        accepted = _js_click_cookie_accept(sb)
-
+    """Handle only an on-screen cookie overlay; never touch footer links."""
+    accepted = _js_click_cookie_accept(sb)
     if accepted:
-        print("[Sportzino] Cookie consent accepted.")
-        sb.wait(0.5)
+        print("[Sportzino] Cookie consent accepted from an active overlay.")
+        sb.wait(0.4)
         return True
-
-    # The visible login screenshot shows a Manage Cookies control. Open it and
-    # search again for the actual Accept All option.
-    managed = _try_click_any(sb, COOKIE_MANAGE_LOCATORS, timeout_each=1.5)
-    if managed:
-        print("[Sportzino] Opened cookie settings.")
-        sb.wait(0.6)
-
-        accepted = _try_click_any(sb, COOKIE_ACCEPT_LOCATORS, timeout_each=2)
-        if not accepted:
-            accepted = _js_click_cookie_accept(sb)
-
-        if accepted:
-            print("[Sportzino] Cookie consent accepted from settings.")
-            sb.wait(0.5)
-            return True
 
     neutralized = _neutralize_cookie_overlay(sb)
     if neutralized:
-        print("[Sportzino] Cookie overlay neutralized after accept controls were unavailable.")
+        print("[Sportzino] Blocking cookie overlay neutralized.")
+        sb.wait(0.2)
 
     return neutralized
 
@@ -543,40 +638,158 @@ def _handle_cookie_consent(sb: SB) -> bool:
 # ───────────────────────────────────────────────────────────
 
 def _captcha_looks_ready(sb: SB) -> bool:
-    snapshot = _page_snapshot(sb)
-    upper = _up(snapshot["text"])
+    data = _safe_js(
+        sb,
+        r"""
+        const text = (document.body && (document.body.innerText || document.body.textContent) || '')
+            .replace(/\s+/g, ' ')
+            .toLowerCase();
 
-    return (
-        "SUCCESS!" in upper
-        or "VERIFICATION SUCCESSFUL" in upper
-        or "CHALLENGE PASSED" in upper
-        or "CLOUDFLARE" not in upper
+        const response = document.querySelector(
+            'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], ' +
+            'input[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
+        );
+        const token = response ? (response.value || '') : '';
+
+        const form = document.querySelector('form.login-form') ||
+            document.querySelector('#emailAddress')?.closest('form');
+        const button = form && form.querySelector(
+            '.login-form-login-button-container button, button[type="submit"], button[data-testid="login-submit-button"]'
+        );
+        const enabled = Boolean(button && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
+
+        return {
+            successText: text.includes('success!') ||
+                text.includes('verification successful') ||
+                text.includes('challenge passed'),
+            tokenReady: token.length > 10,
+            submitEnabled: enabled,
+            hasChallenge: Boolean(document.querySelector(
+                'iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-sitekey]'
+            ))
+        };
+        """,
+        default={},
+    )
+
+    if not isinstance(data, dict):
+        return False
+
+    return bool(
+        data.get("successText")
+        or data.get("tokenReady")
+        or (data.get("submitEnabled") and not data.get("hasChallenge"))
+    )
+
+
+def _login_values_present(sb: SB, username: str, password: str) -> bool:
+    values = _safe_js(
+        sb,
+        """
+        const email = document.querySelector('#emailAddress, input[data-testid="login-email-input"]');
+        const password = document.querySelector('#password, input[data-testid="login-password-input"]');
+        return {
+            email: email ? (email.value || '') : '',
+            password: password ? (password.value || '') : ''
+        };
+        """,
+        default={},
+    )
+    return isinstance(values, dict) and values.get("email") == username and values.get("password") == password
+
+
+def _focus_login_form(sb: SB) -> None:
+    """Return to the login form after any GUI captcha interaction."""
+    _safe_js(
+        sb,
+        """
+        const email = document.querySelector('#emailAddress, input[data-testid="login-email-input"]');
+        if (email) {
+            email.scrollIntoView({block: 'center', inline: 'nearest'});
+        } else {
+            window.scrollTo({top: 0, left: 0, behavior: 'instant'});
+        }
+        """,
+        default=None,
     )
 
 
 def _submit_login(sb: SB, password_locator: str) -> bool:
-    # Explicit button is preferred because the current page has a normal form
-    # and Enter can be swallowed by the Cloudflare widget.
-    if _try_click_any(sb, SUBMIT_LOCATORS, timeout_each=4):
-        print("[Sportzino] Login form submitted with button.")
+    # First use the exact form-scoped button. No scroll_to() is used here.
+    for locator in SUBMIT_LOCATORS:
+        try:
+            sb.wait_for_element_visible(locator, timeout=2)
+            button = sb.find_element(locator)
+            disabled = _safe_js(
+                sb,
+                "return Boolean(arguments[0].disabled || arguments[0].getAttribute('aria-disabled') === 'true');",
+                button,
+                default=True,
+            )
+            if disabled:
+                continue
+
+            sb.execute_script("arguments[0].click();", button)
+            print(f"[Sportzino] Login submitted with: {locator}")
+            return True
+        except Exception:
+            continue
+
+    # DOM fallback stays scoped to the form containing #emailAddress.
+    submitted = bool(
+        _safe_js(
+            sb,
+            """
+            const email = document.querySelector('#emailAddress, input[data-testid="login-email-input"]');
+            const form = email && email.closest('form');
+            if (!form) return false;
+
+            const button = form.querySelector(
+                '.login-form-login-button-container button, button[type="submit"], button[data-testid="login-submit-button"]'
+            );
+            if (button && !button.disabled && button.getAttribute('aria-disabled') !== 'true') {
+                button.click();
+                return true;
+            }
+
+            if (typeof form.requestSubmit === 'function') {
+                form.requestSubmit();
+                return true;
+            }
+            return false;
+            """,
+            default=False,
+        )
+    )
+    if submitted:
+        print("[Sportzino] Login submitted through the containing form.")
         return True
 
     try:
         sb.press_keys(password_locator, "\n")
-        print("[Sportzino] Login form submitted with Enter fallback.")
+        print("[Sportzino] Login submitted with Enter fallback.")
         return True
     except Exception:
         return False
 
 
-def _wait_for_authentication(sb: SB, timeout: float = 35) -> Dict[str, str]:
-    """Wait for a real redirect away from the login form."""
+def _wait_for_authentication(
+    sb: SB,
+    password_locator: str,
+    timeout: float = 45,
+) -> Dict[str, str]:
+    """Wait for the login controls to disappear and the URL to leave /login."""
     step = 1.0
     loops = max(1, int(timeout / step))
     last = {"status": "unknown", "reason": "No state yet", "evidence": ""}
 
     for index in range(loops):
-        _handle_cookie_consent(sb)
+        # Cookie handling is deliberately infrequent and overlay-only. The old
+        # code clicked the static footer's Manage Cookies link every second,
+        # which is exactly what dragged the browser to the bottom of the page.
+        if index in (0, 10, 25):
+            _handle_cookie_consent(sb)
+
         snapshot = _page_snapshot(sb)
         text = snapshot["text"]
 
@@ -591,20 +804,20 @@ def _wait_for_authentication(sb: SB, timeout: float = 35) -> Dict[str, str]:
         if _is_authenticated(sb):
             return {
                 "status": "authenticated",
-                "reason": "Login form disappeared and browser left the login route",
+                "reason": "Login controls disappeared and the browser left the login route",
                 "evidence": snapshot["url"],
             }
 
         last = {
             "status": "login_pending",
-            "reason": "Still on the login page",
+            "reason": "Still on the login page after submitting the form",
             "evidence": snapshot["url"],
         }
 
-        # A delayed Cloudflare completion can enable the same button after the
-        # first click. Retry once without refilling the credentials.
-        if index in (7, 15) and _captcha_looks_ready(sb):
-            _try_click_any(sb, SUBMIT_LOCATORS, timeout_each=2)
+        # Retry the same form submission after a delayed Turnstile completion.
+        if index in (8, 18, 30) and _captcha_looks_ready(sb):
+            _focus_login_form(sb)
+            _submit_login(sb, password_locator)
 
         sb.wait(step)
 
@@ -616,6 +829,16 @@ def _login(sb: SB, username: str, password: str) -> Dict[str, str]:
     sb.wait_for_ready_state_complete()
     print("[Sportzino] Login page loaded.")
 
+    try:
+        sb.wait_for_element_visible("#emailAddress", timeout=20)
+        sb.wait_for_element_visible("#password", timeout=20)
+    except Exception:
+        # Continue through fallback locators so a small markup change still has
+        # a chance to work and produces a useful result message.
+        pass
+
+    # Start at the form, not the footer. Cookie handling below cannot scroll.
+    _safe_js(sb, "window.scrollTo({top: 0, left: 0, behavior: 'instant'});", default=None)
     _handle_cookie_consent(sb)
 
     email_locator = _fill_input(sb, EMAIL_LOCATORS, username, "email")
@@ -624,36 +847,57 @@ def _login(sb: SB, username: str, password: str) -> Dict[str, str]:
     if not email_locator or not password_locator:
         return {
             "status": "login_fields_missing",
-            "reason": "The current email/password inputs could not be filled",
+            "reason": "The current #emailAddress/#password inputs could not be filled",
             "evidence": f"email={bool(email_locator)} password={bool(password_locator)}",
         }
 
-    # Give Cloudflare a moment to initialize after the inputs are populated.
-    sb.wait(1.5)
+    if not _login_values_present(sb, username, password):
+        return {
+            "status": "login_fields_rejected",
+            "reason": "Sportzino cleared or rejected one of the login field values",
+            "evidence": "The values did not remain in #emailAddress and #password",
+        }
 
-    try:
-        sb.uc_gui_click_captcha()
-        print("[Sportzino] Cloudflare captcha click attempted.")
-    except Exception as exc:
-        print(f"[Sportzino] Captcha click was unnecessary or unavailable: {exc}")
+    sb.wait(1.0)
 
-    # Wait briefly for the visible "Success!" state shown in the supplied
-    # screenshot, but do not require it because Cloudflare can be invisible.
-    for _ in range(12):
+    # Only invoke SeleniumBase's GUI captcha helper when the page has not
+    # already reached the visible Success state shown in the supplied image.
+    if not _captcha_looks_ready(sb):
+        try:
+            sb.uc_gui_click_captcha()
+            print("[Sportzino] Cloudflare captcha click attempted.")
+        except Exception as exc:
+            print(f"[Sportzino] Captcha click was unnecessary or unavailable: {exc}")
+
+    for _ in range(30):
         if _captcha_looks_ready(sb):
             break
         sb.wait(0.5)
 
+    # GUI captcha interaction can move the viewport. Put the actual login form
+    # back in view, then verify/refill the exact IDs before submitting.
+    _focus_login_form(sb)
     _handle_cookie_consent(sb)
+
+    if not _login_values_present(sb, username, password):
+        email_locator = _fill_input(sb, EMAIL_LOCATORS, username, "email")
+        password_locator = _fill_input(sb, PASSWORD_LOCATORS, password, "password")
+
+    if not email_locator or not password_locator or not _login_values_present(sb, username, password):
+        return {
+            "status": "login_fields_lost",
+            "reason": "The login values disappeared before form submission",
+            "evidence": "Could not restore #emailAddress/#password",
+        }
 
     if not _submit_login(sb, password_locator):
         return {
             "status": "submit_failed",
-            "reason": "Could not click or submit the login form",
-            "evidence": "No submit method succeeded",
+            "reason": "Could not click or submit the Sportzino login form",
+            "evidence": "No enabled form-scoped Log In button was available",
         }
 
-    return _wait_for_authentication(sb, timeout=35)
+    return _wait_for_authentication(sb, password_locator, timeout=45)
 
 
 # ───────────────────────────────────────────────────────────
@@ -866,8 +1110,9 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
     Sportzino via SeleniumBase UC.
 
     Important changes:
-    - Uses the current data-testid/name attributes plus the supplied XPaths.
-    - Accepts or neutralizes the cookie popup before interacting with the form.
+    - Uses the exact #emailAddress and #password IDs first.
+    - Never clicks the static footer Manage Cookies link or scrolls there.
+    - Accepts or neutralizes only a real fixed/sticky cookie overlay.
     - Waits for a confirmed redirect away from /login before looking for Rewards.
     - Never reports "Rewards section not found" while the login form is still open.
     - Conservatively verifies claim success after clicking Collect/Claim.
