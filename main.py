@@ -216,6 +216,7 @@ api_modules = [
     "playtanaAPI",
     "cashoomoAPI",
     "taofortuneAPI",
+    "sweepjungleAPI",
     "zumoAPI",
     "yaycasinoAPI",
     "luckylandAPI",
@@ -1218,6 +1219,10 @@ async def _run_taofortune(channel):
     await taofortune_casino(None, driver, channel)
 
 
+async def _run_sweepjungle(channel):
+    await sweepjungle_casino(None, driver, channel)
+
+
 async def _run_zumo(channel):
     await zumo_casino(None, driver, channel)
 
@@ -1303,7 +1308,10 @@ casino_loop_entries: List[CasinoLoopEntry] = [
     CasinoLoopEntry("lonestar", "LoneStar Casino", _run_lonestar, 1440),
     CasinoLoopEntry("wildworld", "WildWorld", _run_wildworld, 1440),
     CasinoLoopEntry("funrize", "Funrize", _run_funrize, 1440),
+
+    CasinoLoopEntry("sweepjungle", "SweepJungle", _run_sweepjungle, 1440),
     CasinoLoopEntry("zumo", "Zumo", _run_zumo, 1440),
+
     CasinoLoopEntry("rollingriches", "Rolling Riches", _run_rollingriches, 1440),
     CasinoLoopEntry("americanluck", "American Luck", _run_americanluck, 1440),
     CasinoLoopEntry("fortunecoins", "Fortune Coins", _run_fortunecoins, 1440),
@@ -2049,6 +2057,7 @@ MANUAL_CASINO_COMMANDS = {
     "playtana",
     "cashoomo",
     "taofortune",
+    "sweepjungle",
     "zumo",
     "luckparty",
     "luckyparty",
@@ -3121,6 +3130,16 @@ async def taofortune_cmd(ctx):
     )
 
 
+@bot.command(name="sweepjungle")
+async def sweepjungle_cmd(ctx):
+    await ctx.send("Checking SweepJungle for bonus...")
+    await _run_manual_casino_command(
+        ctx,
+        "SweepJungle",
+        lambda pctx, channel: sweepjungle_casino(pctx, driver, channel),
+    )
+
+
 @bot.command(name="zumo")
 async def zumo_cmd(ctx):
     await ctx.send("Checking Zumo for bonus...")
@@ -3333,6 +3352,7 @@ async def _debug_worker_flow(ctx, channel, key: str):
         "playtana": lambda: playtana_casino(ctx, driver, channel),
         "cashoomo": lambda: cashoomo_casino(ctx, driver, channel),
         "taofortune": lambda: taofortune_casino(ctx, driver, channel),
+        "sweepjungle": lambda: sweepjungle_casino(ctx, driver, channel),
         "zumo": lambda: zumo_casino(ctx, driver, channel),
         "crowncoins": lambda: crowncoins_casino(driver, _bot(), ctx, channel),
         "americanluck": lambda: americanluck_uc(ctx, channel),
@@ -3597,7 +3617,8 @@ async def help_cmd(ctx):
 !fortunecoins, !nolimitcoins, !fortunewheelz, !stake, !dingdingding,
 !smilescasino, !yaycasino, !realprize, !luckyland, !jumbo, !spree,
 !chipnwin, !wildworld, !lonestar, !gains, !luckparty, !winbonanza,
-!stormrush, !scarletsands, !playtana, !cashoomo, !taofortune, !zumo,
+!stormrush, !scarletsands, !playtana, !cashoomo, !taofortune,
+!sweepjungle, !zumo,
 
 Aliases:
 !luckyparty, !lp
