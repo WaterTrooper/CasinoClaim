@@ -2,7 +2,7 @@
 # Casino Claim 3
 # Stormrush API
 # Version 3.3
-# Updated 2026.07.11
+# Updated 2026.07.17
 
 import re
 import os
@@ -33,7 +33,7 @@ PASSWORD_INPUT_XPATH = "//input[@data-tid='login-password-input']"
 LOGIN_SUBMIT_XPATH = "//button[@data-tid='login-btn']"
 
 REWARD_BUTTON_XPATH = "//button[@data-tid='promotion-card-dailyrewards-btn']"
-CLAIM_BUTTON_XPATH = "//button[@data-tid='dailyRewards_modal_play_collect']"
+CLAIM_BUTTON_XPATH = "//button[@data-tid='dailyRewards_modal_play_collect' or @data-tid='dailyRewards_modal_play_spin']"
 
 # ───────────────────────────────────────────────────────────
 # 0) Helpers
