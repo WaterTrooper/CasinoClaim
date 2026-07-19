@@ -2,7 +2,7 @@
 # Casino Claim 3
 # NoLimitCoins API
 # Version 3.4
-# Updated 2026.07.18
+# Updated 2026.07.19
 
 import re
 import os
@@ -35,7 +35,7 @@ LOGIN_SUBMIT_XPATH = "//button[@data-tid='login-btn']"
 
 POPUP_BUTTON_XPATH = "//span[@data-tid='close-modal']"
 REWARD_BUTTON_XPATH = "//button[@data-tid='promotion-card-dailylogin-btn']"
-CLAIM_BUTTON_XPATH = "//button[@data-tid='dailyRewards_modal_play_spin']"
+CLAIM_BUTTON_XPATH = "//button[@data-tid='dailyRewards_modal_play_collect' or @data-tid='dailyRewards_modal_play_spin']"
 
 
 # ───────────────────────────────────────────────────────────
