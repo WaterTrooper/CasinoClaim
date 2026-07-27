@@ -1,7 +1,7 @@
 # Drake Hooks + WaterTrooper
 # Casino Claim 3
 # Sportzino API (SeleniumBase UC)
-# Exact-ID login, non-scrolling cookie handling, and conservative claim verification.
+# Simple login, intelligent Progressive Daily Bonus candidacy, and verified claiming.
 
 import os
 import re
@@ -202,7 +202,6 @@ def _page_snapshot(sb: SB) -> Dict[str, str]:
             " ".join(
                 [
                     data.get("title", ""),
-                    data.get("body", ""),
                     data.get("visibleText", ""),
                 ]
             )
@@ -296,24 +295,41 @@ async def _send_screenshot(
     channel: discord.abc.Messageable,
     caption: str,
     prefix: str,
+    discord_message: Optional[str] = None,
 ):
-    fd, path = tempfile.mkstemp(prefix=f"{prefix}_", suffix=".png", dir="/tmp")
+    """
+    Print all status/debug information to the worker console.
+
+    When discord_message is provided, send that exact final status to Discord,
+    followed by the screenshot. Other internal details remain console-only.
+    """
+    print(caption)
+
+    fd, path = tempfile.mkstemp(
+        prefix=f"{prefix}_",
+        suffix=".png",
+        dir="/tmp",
+    )
     os.close(fd)
 
     try:
         sb.save_screenshot(path)
-        await channel.send(caption, file=discord.File(path))
-    except Exception:
-        try:
-            await channel.send(caption)
-        except Exception:
-            pass
+
+        if discord_message:
+            await channel.send(discord_message)
+
+        await channel.send(file=discord.File(path))
+    except Exception as error:
+        print(f"[Sportzino][SCREENSHOT ERROR] {error}")
     finally:
         try:
             if os.path.exists(path):
                 os.remove(path)
-        except Exception:
-            pass
+        except Exception as cleanup_error:
+            print(
+                "[Sportzino][SCREENSHOT CLEANUP ERROR] "
+                f"{cleanup_error}"
+            )
 
 
 # ───────────────────────────────────────────────────────────
@@ -637,267 +653,312 @@ def _handle_cookie_consent(sb: SB) -> bool:
 # Login flow
 # ───────────────────────────────────────────────────────────
 
-def _captcha_looks_ready(sb: SB) -> bool:
-    data = _safe_js(
-        sb,
-        r"""
-        const text = (document.body && (document.body.innerText || document.body.textContent) || '')
-            .replace(/\s+/g, ' ')
-            .toLowerCase();
+def _simple_login_button_enabled(sb: SB) -> bool:
+    """Return True when the real Sportzino Log In button is enabled."""
+    try:
+        return bool(
+            sb.execute_script(
+                """
+                const button = document.querySelector(
+                    'form.login-form .login-form-login-button-container button'
+                );
 
-        const response = document.querySelector(
-            'input[name="cf-turnstile-response"], textarea[name="cf-turnstile-response"], ' +
-            'input[name="g-recaptcha-response"], textarea[name="g-recaptcha-response"]'
-        );
-        const token = response ? (response.value || '') : '';
-
-        const form = document.querySelector('form.login-form') ||
-            document.querySelector('#emailAddress')?.closest('form');
-        const button = form && form.querySelector(
-            '.login-form-login-button-container button, button[type="submit"], button[data-testid="login-submit-button"]'
-        );
-        const enabled = Boolean(button && !button.disabled && button.getAttribute('aria-disabled') !== 'true');
-
-        return {
-            successText: text.includes('success!') ||
-                text.includes('verification successful') ||
-                text.includes('challenge passed'),
-            tokenReady: token.length > 10,
-            submitEnabled: enabled,
-            hasChallenge: Boolean(document.querySelector(
-                'iframe[src*="challenges.cloudflare.com"], .cf-turnstile, [data-sitekey]'
-            ))
-        };
-        """,
-        default={},
-    )
-
-    if not isinstance(data, dict):
+                return Boolean(
+                    button &&
+                    !button.disabled &&
+                    button.getAttribute('aria-disabled') !== 'true'
+                );
+                """
+            )
+        )
+    except Exception:
         return False
 
-    return bool(
-        data.get("successText")
-        or data.get("tokenReady")
-        or (data.get("submitEnabled") and not data.get("hasChallenge"))
+
+def _simple_click_login_button(sb: SB) -> bool:
+    """
+    Click only the Log In button inside Sportzino's email/password form.
+
+    This intentionally follows the same simple approach used by the working
+    American Luck login instead of changing React input values through JS.
+    """
+    locators = (
+        "form.login-form .login-form-login-button-container button",
+        ".login-form-login-button-container button",
+        "//form[contains(@class,'login-form')]"
+        "//div[contains(@class,'login-form-login-button-container')]//button",
+        "//form[contains(@class,'login-form')]"
+        "//button[normalize-space()='Log In']",
     )
 
-
-def _login_values_present(sb: SB, username: str, password: str) -> bool:
-    values = _safe_js(
-        sb,
-        """
-        const email = document.querySelector('#emailAddress, input[data-testid="login-email-input"]');
-        const password = document.querySelector('#password, input[data-testid="login-password-input"]');
-        return {
-            email: email ? (email.value || '') : '',
-            password: password ? (password.value || '') : ''
-        };
-        """,
-        default={},
-    )
-    return isinstance(values, dict) and values.get("email") == username and values.get("password") == password
-
-
-def _focus_login_form(sb: SB) -> None:
-    """Return to the login form after any GUI captcha interaction."""
-    _safe_js(
-        sb,
-        """
-        const email = document.querySelector('#emailAddress, input[data-testid="login-email-input"]');
-        if (email) {
-            email.scrollIntoView({block: 'center', inline: 'nearest'});
-        } else {
-            window.scrollTo({top: 0, left: 0, behavior: 'instant'});
-        }
-        """,
-        default=None,
-    )
-
-
-def _submit_login(sb: SB, password_locator: str) -> bool:
-    # First use the exact form-scoped button. No scroll_to() is used here.
-    for locator in SUBMIT_LOCATORS:
+    for locator in locators:
         try:
-            sb.wait_for_element_visible(locator, timeout=2)
-            button = sb.find_element(locator)
-            disabled = _safe_js(
-                sb,
-                "return Boolean(arguments[0].disabled || arguments[0].getAttribute('aria-disabled') === 'true');",
-                button,
-                default=True,
-            )
-            if disabled:
-                continue
-
-            sb.execute_script("arguments[0].click();", button)
-            print(f"[Sportzino] Login submitted with: {locator}")
+            sb.wait_for_element_visible(locator, timeout=4)
+            sb.click(locator)
+            print(f"[Sportzino] Clicked Log In using: {locator}")
             return True
-        except Exception:
-            continue
+        except Exception as error:
+            print(
+                f"[Sportzino] Login click locator failed "
+                f"({locator}): {error}"
+            )
 
-    # DOM fallback stays scoped to the form containing #emailAddress.
-    submitted = bool(
-        _safe_js(
-            sb,
-            """
-            const email = document.querySelector('#emailAddress, input[data-testid="login-email-input"]');
-            const form = email && email.closest('form');
-            if (!form) return false;
-
-            const button = form.querySelector(
-                '.login-form-login-button-container button, button[type="submit"], button[data-testid="login-submit-button"]'
-            );
-            if (button && !button.disabled && button.getAttribute('aria-disabled') !== 'true') {
-                button.click();
-                return true;
-            }
-
-            if (typeof form.requestSubmit === 'function') {
-                form.requestSubmit();
-                return true;
-            }
-            return false;
-            """,
-            default=False,
+    # Same hard-click fallback style used by American Luck.
+    try:
+        button = sb.find_element(
+            "form.login-form .login-form-login-button-container button"
         )
-    )
-    if submitted:
-        print("[Sportzino] Login submitted through the containing form.")
+        sb.execute_script(
+            "arguments[0].scrollIntoView({block:'center'});",
+            button,
+        )
+        sb.wait(0.3)
+        button.click()
+        print("[Sportzino] Clicked Log In with WebElement fallback.")
         return True
+    except Exception:
+        pass
 
     try:
-        sb.press_keys(password_locator, "\n")
-        print("[Sportzino] Login submitted with Enter fallback.")
+        button = sb.find_element(
+            "form.login-form .login-form-login-button-container button"
+        )
+        sb.execute_script("arguments[0].click();", button)
+        print("[Sportzino] Clicked Log In with JS fallback.")
         return True
     except Exception:
         return False
 
 
-def _wait_for_authentication(
-    sb: SB,
-    password_locator: str,
-    timeout: float = 45,
-) -> Dict[str, str]:
-    """Wait for the login controls to disappear and the URL to leave /login."""
-    step = 1.0
-    loops = max(1, int(timeout / step))
-    last = {"status": "unknown", "reason": "No state yet", "evidence": ""}
-
-    for index in range(loops):
-        # Cookie handling is deliberately infrequent and overlay-only. The old
-        # code clicked the static footer's Manage Cookies link every second,
-        # which is exactly what dragged the browser to the bottom of the page.
-        if index in (0, 10, 25):
-            _handle_cookie_consent(sb)
-
-        snapshot = _page_snapshot(sb)
-        text = snapshot["text"]
-
-        error_hit = _first_marker(text, LOGIN_ERROR_MARKERS)
-        if error_hit:
-            return {
-                "status": "login_error",
-                "reason": "The login page displayed an error",
-                "evidence": error_hit,
-            }
-
-        if _is_authenticated(sb):
-            return {
-                "status": "authenticated",
-                "reason": "Login controls disappeared and the browser left the login route",
-                "evidence": snapshot["url"],
-            }
-
-        last = {
-            "status": "login_pending",
-            "reason": "Still on the login page after submitting the form",
-            "evidence": snapshot["url"],
-        }
-
-        # Retry the same form submission after a delayed Turnstile completion.
-        if index in (8, 18, 30) and _captcha_looks_ready(sb):
-            _focus_login_form(sb)
-            _submit_login(sb, password_locator)
-
-        sb.wait(step)
-
-    return last
+def _simple_login_error(sb: SB) -> str:
+    snapshot = _page_snapshot(sb)
+    return _first_marker(snapshot["text"], LOGIN_ERROR_MARKERS)
 
 
 def _login(sb: SB, username: str, password: str) -> Dict[str, str]:
-    sb.uc_open_with_reconnect(LOGIN_URL, 4)
-    sb.wait_for_ready_state_complete()
+    """
+    Simple Sportzino login modeled after the working American Luck login:
+
+    1. Open the login page.
+    2. Type directly into #emailAddress and #password with SeleniumBase.
+    3. Click the Cloudflare challenge when needed.
+    4. Click the form's real Log In button.
+    5. Wait for the login form to disappear or the URL to leave /login.
+
+    No JavaScript value injection is used for the credentials.
+    """
+    sb.uc_open_with_reconnect(LOGIN_URL, 8)
+
+    try:
+        sb.wait_for_ready_state_complete()
+    except Exception:
+        pass
+
+    sb.wait(2)
     print("[Sportzino] Login page loaded.")
+
+    # Handle only a real on-screen cookie overlay. This cannot click the
+    # footer's Manage Cookies link.
+    _handle_cookie_consent(sb)
 
     try:
         sb.wait_for_element_visible("#emailAddress", timeout=20)
         sb.wait_for_element_visible("#password", timeout=20)
-    except Exception:
-        # Continue through fallback locators so a small markup change still has
-        # a chance to work and produces a useful result message.
-        pass
-
-    # Start at the form, not the footer. Cookie handling below cannot scroll.
-    _safe_js(sb, "window.scrollTo({top: 0, left: 0, behavior: 'instant'});", default=None)
-    _handle_cookie_consent(sb)
-
-    email_locator = _fill_input(sb, EMAIL_LOCATORS, username, "email")
-    password_locator = _fill_input(sb, PASSWORD_LOCATORS, password, "password")
-
-    if not email_locator or not password_locator:
+    except Exception as error:
         return {
             "status": "login_fields_missing",
-            "reason": "The current #emailAddress/#password inputs could not be filled",
-            "evidence": f"email={bool(email_locator)} password={bool(password_locator)}",
+            "reason": "The Sportzino email/password fields did not appear",
+            "evidence": str(error),
         }
 
-    if not _login_values_present(sb, username, password):
+    # Keep the form in view before typing.
+    try:
+        sb.execute_script(
+            """
+            const email = document.querySelector('#emailAddress');
+            if (email) {
+                email.scrollIntoView({
+                    block: 'center',
+                    inline: 'nearest'
+                });
+            }
+            """
+        )
+    except Exception:
+        pass
+
+    # IMPORTANT: Use normal SeleniumBase typing exactly like American Luck.
+    # The previous JS/React setter could make the fields look populated while
+    # Sportzino's form state still submitted blank values.
+    try:
+        sb.click("#emailAddress")
+        sb.type("#emailAddress", username)
+        print(
+            "[Sportzino] Typed email directly into #emailAddress "
+            f"({len(username)} characters)."
+        )
+
+        sb.click("#password")
+        sb.type("#password", password)
+        print(
+            "[Sportzino] Typed password directly into #password "
+            f"({len(password)} characters)."
+        )
+    except Exception as error:
+        return {
+            "status": "login_typing_failed",
+            "reason": "Could not type into the Sportzino login fields",
+            "evidence": str(error),
+        }
+
+    # Confirm the browser truly contains the credentials before touching
+    # Cloudflare or the submit button.
+    try:
+        typed_email = sb.get_attribute("#emailAddress", "value") or ""
+        typed_password = sb.get_attribute("#password", "value") or ""
+    except Exception:
+        typed_email = ""
+        typed_password = ""
+
+    print(
+        "[Sportzino] Field check before captcha: "
+        f"email_chars={len(typed_email)} "
+        f"password_chars={len(typed_password)}"
+    )
+
+    if typed_email != username or typed_password != password:
         return {
             "status": "login_fields_rejected",
-            "reason": "Sportzino cleared or rejected one of the login field values",
-            "evidence": "The values did not remain in #emailAddress and #password",
+            "reason": "Sportzino did not retain the typed credentials",
+            "evidence": (
+                f"email_chars={len(typed_email)} "
+                f"password_chars={len(typed_password)}"
+            ),
         }
 
-    sb.wait(1.0)
+    # Same Cloudflare handling sequence as American Luck.
+    try:
+        sb.uc_gui_click_captcha()
+        print("[Sportzino] Cloudflare click attempted.")
+    except Exception as error:
+        print(
+            "[Sportzino] Cloudflare click was unnecessary or unavailable: "
+            f"{error}"
+        )
 
-    # Only invoke SeleniumBase's GUI captcha helper when the page has not
-    # already reached the visible Success state shown in the supplied image.
-    if not _captcha_looks_ready(sb):
-        try:
-            sb.uc_gui_click_captcha()
-            print("[Sportzino] Cloudflare captcha click attempted.")
-        except Exception as exc:
-            print(f"[Sportzino] Captcha click was unnecessary or unavailable: {exc}")
+    sb.wait(1.5)
 
-    for _ in range(30):
-        if _captcha_looks_ready(sb):
+    # Give Turnstile a reasonable amount of time to enable the form button.
+    # Do not repeatedly submit or rewrite the fields.
+    for second_half in range(30):
+        if _simple_login_button_enabled(sb):
             break
+
+        if second_half == 15:
+            try:
+                sb.uc_gui_click_captcha()
+                print("[Sportzino] Retried the Cloudflare click once.")
+            except Exception:
+                pass
+
         sb.wait(0.5)
 
-    # GUI captcha interaction can move the viewport. Put the actual login form
-    # back in view, then verify/refill the exact IDs before submitting.
-    _focus_login_form(sb)
-    _handle_cookie_consent(sb)
+    # A GUI captcha interaction may have moved the viewport. Return only to
+    # the login form, then click its exact Log In button.
+    try:
+        sb.execute_script(
+            """
+            const button = document.querySelector(
+                'form.login-form .login-form-login-button-container button'
+            );
+            if (button) {
+                button.scrollIntoView({
+                    block: 'center',
+                    inline: 'nearest'
+                });
+            }
+            """
+        )
+    except Exception:
+        pass
 
-    if not _login_values_present(sb, username, password):
-        email_locator = _fill_input(sb, EMAIL_LOCATORS, username, "email")
-        password_locator = _fill_input(sb, PASSWORD_LOCATORS, password, "password")
+    # Verify that Cloudflare interaction did not erase the inputs.
+    try:
+        typed_email = sb.get_attribute("#emailAddress", "value") or ""
+        typed_password = sb.get_attribute("#password", "value") or ""
+    except Exception:
+        typed_email = ""
+        typed_password = ""
 
-    if not email_locator or not password_locator or not _login_values_present(sb, username, password):
+    print(
+        "[Sportzino] Field check before submit: "
+        f"email_chars={len(typed_email)} "
+        f"password_chars={len(typed_password)}"
+    )
+
+    if typed_email != username or typed_password != password:
+        # One simple normal-typing retry, still with no JS value injection.
+        try:
+            sb.type("#emailAddress", username)
+            sb.type("#password", password)
+            typed_email = sb.get_attribute("#emailAddress", "value") or ""
+            typed_password = sb.get_attribute("#password", "value") or ""
+        except Exception:
+            pass
+
+    if typed_email != username or typed_password != password:
         return {
             "status": "login_fields_lost",
-            "reason": "The login values disappeared before form submission",
-            "evidence": "Could not restore #emailAddress/#password",
+            "reason": "The credentials disappeared before Log In was clicked",
+            "evidence": (
+                f"email_chars={len(typed_email)} "
+                f"password_chars={len(typed_password)}"
+            ),
         }
 
-    if not _submit_login(sb, password_locator):
-        return {
-            "status": "submit_failed",
-            "reason": "Could not click or submit the Sportzino login form",
-            "evidence": "No enabled form-scoped Log In button was available",
-        }
+    if not _simple_click_login_button(sb):
+        # Final American-Luck-style Enter fallback.
+        try:
+            sb.press_keys("#password", "\n")
+            print("[Sportzino] Submitted login with Enter fallback.")
+        except Exception as error:
+            return {
+                "status": "submit_failed",
+                "reason": "Could not click or submit the Sportzino login form",
+                "evidence": str(error),
+            }
 
-    return _wait_for_authentication(sb, password_locator, timeout=45)
+    # Wait for either success, a visible login error, or timeout.
+    for index in range(60):
+        error_hit = _simple_login_error(sb)
+        if error_hit:
+            return {
+                "status": "login_error",
+                "reason": "Sportzino displayed a login error",
+                "evidence": error_hit,
+            }
+
+        if _is_authenticated(sb):
+            snapshot = _page_snapshot(sb)
+            return {
+                "status": "authenticated",
+                "reason": "Sportzino left the login page",
+                "evidence": snapshot["url"],
+            }
+
+        # Some Turnstile forms accept the first click only after the token
+        # settles. Retry the exact button once, without retyping anything.
+        if index == 20 and _simple_login_button_enabled(sb):
+            _simple_click_login_button(sb)
+
+        sb.wait(0.5)
+
+    snapshot = _page_snapshot(sb)
+    return {
+        "status": "login_pending",
+        "reason": "Still on the login page after the simple login attempt",
+        "evidence": snapshot["url"],
+    }
 
 
 # ───────────────────────────────────────────────────────────
@@ -1019,17 +1080,598 @@ def _open_rewards(sb: SB) -> bool:
     return _force_click(sb, f"[data-sportzino-reward-id='{candidate_id}']", timeout=2)
 
 
+def _rewards_dialog_open(sb: SB) -> bool:
+    """Detect the visible Sportzino Coin Store / Claim Free Rewards dialog."""
+    return bool(
+        _safe_js(
+            sb,
+            r"""
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+
+                return (
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    style.opacity !== '0' &&
+                    rect.width > 0 &&
+                    rect.height > 0
+                );
+            };
+
+            const normalize = (value) => (value || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase();
+
+            const roots = Array.from(document.querySelectorAll(
+                '.coin-store, .dialog-modal, [role="dialog"], ' +
+                '[class*="coin-store" i]'
+            )).filter(visible);
+
+            return roots.some((root) => {
+                const text = normalize(
+                    root.innerText || root.textContent || ''
+                );
+
+                return (
+                    text.includes('claim free rewards') ||
+                    (
+                        text.includes('coin store') &&
+                        text.includes('purchase store packs')
+                    )
+                );
+            });
+            """,
+            default=False,
+        )
+    )
+
+
+def _visible_checkout_detected(sb: SB) -> bool:
+    """
+    Detect only a visible checkout/payment dialog.
+
+    The previous implementation searched all body text, including hidden
+    application markup, which falsely classified the open Coin Store as
+    checkout.
+    """
+    return bool(
+        _safe_js(
+            sb,
+            r"""
+            const visible = (el) => {
+                if (!el) return false;
+                const style = window.getComputedStyle(el);
+                const rect = el.getBoundingClientRect();
+
+                return (
+                    style.display !== 'none' &&
+                    style.visibility !== 'hidden' &&
+                    style.opacity !== '0' &&
+                    rect.width > 0 &&
+                    rect.height > 0
+                );
+            };
+
+            const normalize = (value) => (value || '')
+                .replace(/\s+/g, ' ')
+                .trim()
+                .toLowerCase();
+
+            const roots = Array.from(document.querySelectorAll(
+                '[role="dialog"], .dialog-modal, ' +
+                '[class*="checkout" i], [class*="payment" i], ' +
+                '[class*="order-summary" i]'
+            )).filter(visible);
+
+            return roots.some((root) => {
+                const text = normalize(
+                    root.innerText || root.textContent || ''
+                );
+
+                const isCoinStore =
+                    text.includes('claim free rewards') &&
+                    text.includes('purchase store packs');
+
+                if (isCoinStore) return false;
+
+                const checkoutSignals = [
+                    'order summary',
+                    'payment method',
+                    'total amount to pay',
+                    'credit/debit',
+                    'pay using',
+                    'complete purchase',
+                    'billing information'
+                ];
+
+                return checkoutSignals.some(
+                    (signal) => text.includes(signal)
+                );
+            });
+            """,
+            default=False,
+        )
+    )
+
+
+def _daily_claim_candidates(sb: SB) -> list[Dict[str, Any]]:
+    """
+    Score every visible Collect/Claim button.
+
+    The strongest signals come from Sportzino's stable DOM:
+    - .coin-store-free-rewards-row-item.daily-bonus
+    - .coin-store-collect-button
+    - data-sentry-component="CoinStoreCollectButton"
+    - nearby "Progressive Daily Bonus" / "Daily Bonus" text
+
+    Purchase, Facebook, Google, and generic promotion controls receive large
+    penalties. This keeps the bot from clicking an unrelated Collect button.
+    """
+    result = _safe_js(
+        sb,
+        r"""
+        const visible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+
+            return (
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0
+            );
+        };
+
+        const normalize = (value) => (value || '')
+            .replace(/\s+/g, ' ')
+            .trim()
+            .toLowerCase();
+
+        const controls = Array.from(document.querySelectorAll(
+            'button, [role="button"]'
+        )).filter(visible);
+
+        const candidates = [];
+
+        controls.forEach((button, index) => {
+            const ownText = normalize([
+                button.innerText,
+                button.textContent,
+                button.getAttribute('aria-label'),
+                button.getAttribute('title')
+            ].join(' '));
+
+            if (
+                ownText !== 'collect' &&
+                ownText !== 'claim' &&
+                !ownText.startsWith('collect ') &&
+                !ownText.startsWith('claim ')
+            ) {
+                return;
+            }
+
+            const disabled = Boolean(
+                button.disabled ||
+                button.getAttribute('aria-disabled') === 'true' ||
+                normalize(button.className).includes('disabled')
+            );
+
+            const dailyRoot = button.closest(
+                '.coin-store-free-rewards-row-item.daily-bonus, ' +
+                '[class~="daily-bonus"], ' +
+                '[class*="serial-daily-bonus" i]'
+            );
+
+            const rewardCard = button.closest(
+                '.coin-store-free-rewards-card, ' +
+                '.coin-store-free-rewards-row-item, ' +
+                '[class*="free-rewards-card" i], ' +
+                '[class*="free-rewards-row-item" i]'
+            );
+
+            const section = button.closest(
+                '.coin-store-section, .coin-store-content, ' +
+                '.coin-store, [role="dialog"]'
+            );
+
+            const localRoot =
+                dailyRoot ||
+                rewardCard ||
+                button.parentElement ||
+                button;
+
+            const localText = normalize(
+                localRoot.innerText ||
+                localRoot.textContent ||
+                ''
+            );
+
+            const sectionText = normalize(
+                section
+                    ? (
+                        section.innerText ||
+                        section.textContent ||
+                        ''
+                    )
+                    : ''
+            );
+
+            const className = normalize(button.className);
+            const component = normalize(
+                button.getAttribute('data-sentry-component')
+            );
+
+            let score = 0;
+            const reasons = [];
+
+            if (ownText === 'collect') {
+                score += 120;
+                reasons.push('exact COLLECT text');
+            } else if (ownText === 'claim') {
+                score += 90;
+                reasons.push('exact CLAIM text');
+            } else {
+                score += 45;
+                reasons.push('claim-like text');
+            }
+
+            if (className.includes('coin-store-collect-button')) {
+                score += 220;
+                reasons.push('coin-store-collect-button class');
+            }
+
+            if (component === 'coinstorecollectbutton') {
+                score += 220;
+                reasons.push('CoinStoreCollectButton component');
+            }
+
+            if (dailyRoot) {
+                score += 650;
+                reasons.push('daily-bonus ancestor');
+            }
+
+            if (localText.includes('progressive daily bonus')) {
+                score += 320;
+                reasons.push('Progressive Daily Bonus context');
+            } else if (localText.includes('daily bonus')) {
+                score += 280;
+                reasons.push('Daily Bonus context');
+            }
+
+            if (sectionText.includes('claim free rewards')) {
+                score += 140;
+                reasons.push('Claim Free Rewards section');
+            }
+
+            if (
+                localText.includes('day 1') ||
+                localText.includes('day 2') ||
+                localText.includes('day 3') ||
+                localText.includes('day 4') ||
+                localText.includes('day 5') ||
+                localText.includes('day 6') ||
+                localText.includes('day 7')
+            ) {
+                score += 80;
+                reasons.push('daily progression day');
+            }
+
+            if (
+                localText.includes('facebook friendly') ||
+                localText.includes('facebook')
+            ) {
+                score -= 700;
+                reasons.push('Facebook penalty');
+            }
+
+            if (
+                localText.includes('connect with google') ||
+                localText.includes('google grab') ||
+                localText.includes('google')
+            ) {
+                score -= 700;
+                reasons.push('Google penalty');
+            }
+
+            if (
+                localText.includes('purchase') ||
+                localText.includes('buy now') ||
+                localText.includes('checkout') ||
+                /\$\s*\d/.test(localText)
+            ) {
+                score -= 800;
+                reasons.push('purchase/payment penalty');
+            }
+
+            if (
+                localText.includes('see more') &&
+                !localText.includes('daily bonus')
+            ) {
+                score -= 150;
+                reasons.push('generic promotion penalty');
+            }
+
+            if (disabled) {
+                score -= 2000;
+                reasons.push('disabled');
+            }
+
+            const candidateId =
+                `sportzino-daily-claim-${Date.now()}-${index}`;
+
+            button.setAttribute(
+                'data-sportzino-daily-claim-id',
+                candidateId
+            );
+
+            candidates.push({
+                id: candidateId,
+                score,
+                text: ownText,
+                localText: localText.slice(0, 260),
+                className,
+                component,
+                disabled,
+                hasDailyRoot: Boolean(dailyRoot),
+                reasons
+            });
+        });
+
+        candidates.sort((a, b) => b.score - a.score);
+        return candidates;
+        """,
+        default=[],
+    )
+
+    return result if isinstance(result, list) else []
+
+
+def _select_daily_claim_candidate(
+    sb: SB,
+) -> Optional[Dict[str, Any]]:
+    candidates = _daily_claim_candidates(sb)
+
+    if not candidates:
+        print("[Sportzino] No visible Collect/Claim candidates found.")
+        return None
+
+    print("[Sportzino] Claim candidate ranking:")
+
+    for index, candidate in enumerate(candidates[:8], start=1):
+        print(
+            f"  #{index} score={candidate.get('score')} "
+            f"text={candidate.get('text')!r} "
+            f"daily_root={candidate.get('hasDailyRoot')} "
+            f"context={_short(candidate.get('localText', ''), 140)!r} "
+            f"reasons={candidate.get('reasons')}"
+        )
+
+    best = candidates[0]
+    best_score = int(best.get("score", 0))
+    has_daily_root = bool(best.get("hasDailyRoot"))
+    context = _up(best.get("localText", ""))
+
+    context_is_daily = (
+        "PROGRESSIVE DAILY BONUS" in context or
+        "DAILY BONUS" in context
+    )
+
+    # Require both a very strong score and a direct daily-bonus signal.
+    if best_score < 800 or not (has_daily_root or context_is_daily):
+        print(
+            "[Sportzino] Rejected the best candidate because it was not "
+            "confidently tied to the Progressive Daily Bonus card."
+        )
+        return None
+
+    # If two candidates are close, require the winner to have the explicit
+    # daily-bonus ancestor. This avoids ambiguous global Collect buttons.
+    if len(candidates) > 1:
+        second_score = int(candidates[1].get("score", 0))
+
+        if (
+            best_score - second_score < 100 and
+            not has_daily_root
+        ):
+            print(
+                "[Sportzino] Rejected ambiguous claim candidates "
+                f"(best={best_score}, second={second_score})."
+            )
+            return None
+
+    return best
+
+
+def _click_daily_collect(
+    sb: SB,
+) -> Optional[Dict[str, Any]]:
+    candidate = _select_daily_claim_candidate(sb)
+
+    if candidate is None:
+        return None
+
+    candidate_id = candidate.get("id", "")
+    locator = (
+        "[data-sportzino-daily-claim-id="
+        f"'{candidate_id}']"
+    )
+
+    print(
+        "[Sportzino] Selected Progressive Daily Bonus candidate: "
+        f"score={candidate.get('score')} "
+        f"context={_short(candidate.get('localText', ''), 180)!r}"
+    )
+
+    if _force_click(sb, locator, timeout=4):
+        print("[Sportzino] Clicked Progressive Daily Bonus → COLLECT.")
+        return candidate
+
+    # Guarded fallback using the currently inspected XPath. It is clicked only
+    # when the element still scores as a daily-bonus candidate.
+    inspected_xpath = (
+        "/html/body/div[1]/div[1]/div/div/div[2]/div[2]/"
+        "div[2]/div[1]/div/div[3]/div/div[1]/button"
+    )
+
+    for fallback in _daily_claim_candidates(sb):
+        if (
+            int(fallback.get("score", 0)) >= 800 and
+            (
+                fallback.get("hasDailyRoot") or
+                "DAILY BONUS" in _up(fallback.get("localText", ""))
+            )
+        ):
+            try:
+                element = sb.find_element(inspected_xpath)
+                element_text = _up(
+                    _safe_js(
+                        sb,
+                        """
+                        return arguments[0]
+                            ? (
+                                arguments[0].innerText ||
+                                arguments[0].textContent ||
+                                ''
+                            )
+                            : '';
+                        """,
+                        element,
+                        default="",
+                    )
+                )
+
+                if element_text == "COLLECT":
+                    sb.execute_script(
+                        "arguments[0].scrollIntoView({block:'center'});",
+                        element,
+                    )
+                    sb.wait(0.3)
+
+                    try:
+                        element.click()
+                    except Exception:
+                        sb.execute_script(
+                            "arguments[0].click();",
+                            element,
+                        )
+
+                    print(
+                        "[Sportzino] Clicked guarded inspected XPath for "
+                        "Progressive Daily Bonus → COLLECT."
+                    )
+                    return fallback
+            except Exception:
+                pass
+
+    print("[Sportzino] The selected daily claim candidate could not be clicked.")
+    return None
+
+
+def _daily_claim_observation(sb: SB) -> Dict[str, Any]:
+    """
+    Capture the visible state of the Progressive Daily Bonus card and button.
+    """
+    data = _safe_js(
+        sb,
+        r"""
+        const visible = (el) => {
+            if (!el) return false;
+            const style = window.getComputedStyle(el);
+            const rect = el.getBoundingClientRect();
+
+            return (
+                style.display !== 'none' &&
+                style.visibility !== 'hidden' &&
+                style.opacity !== '0' &&
+                rect.width > 0 &&
+                rect.height > 0
+            );
+        };
+
+        const normalize = (value) => (value || '')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        const dailyRoots = Array.from(document.querySelectorAll(
+            '.coin-store-free-rewards-row-item.daily-bonus, ' +
+            '[class~="daily-bonus"]'
+        )).filter(visible);
+
+        const dailyText = dailyRoots
+            .map((root) => normalize(
+                root.innerText || root.textContent || ''
+            ))
+            .join(' | ');
+
+        const collectButtons = dailyRoots.flatMap((root) =>
+            Array.from(root.querySelectorAll(
+                'button.coin-store-collect-button, ' +
+                'button[data-sentry-component="CoinStoreCollectButton"], ' +
+                'button'
+            )).filter((button) => {
+                if (!visible(button)) return false;
+
+                const text = normalize(
+                    button.innerText ||
+                    button.textContent ||
+                    ''
+                ).toLowerCase();
+
+                return (
+                    text === 'collect' ||
+                    text === 'claim' ||
+                    text.startsWith('collect ') ||
+                    text.startsWith('claim ')
+                );
+            })
+        );
+
+        const enabledCollectButtons = collectButtons.filter(
+            (button) => (
+                !button.disabled &&
+                button.getAttribute('aria-disabled') !== 'true'
+            )
+        );
+
+        const visibleMessageText = Array.from(document.querySelectorAll(
+            '[role="alert"], [role="status"], [role="dialog"], ' +
+            '[class*="toast" i], [class*="notification" i], ' +
+            '[class*="message" i]'
+        )).filter(visible).map((node) =>
+            normalize(node.innerText || node.textContent || '')
+        ).join(' | ');
+
+        return {
+            dailyRootCount: dailyRoots.length,
+            dailyText,
+            collectCount: collectButtons.length,
+            enabledCollectCount: enabledCollectButtons.length,
+            visibleMessageText
+        };
+        """,
+        default={},
+    )
+
+    if not isinstance(data, dict):
+        return {
+            "dailyRootCount": 0,
+            "dailyText": "",
+            "collectCount": 0,
+            "enabledCollectCount": 0,
+            "visibleMessageText": "",
+        }
+
+    return data
+
+
 def _current_state(sb: SB) -> Dict[str, str]:
     snapshot = _page_snapshot(sb)
     text = snapshot["text"]
-
-    checkout_hit = _first_marker(text, CHECKOUT_MARKERS)
-    if checkout_hit:
-        return {
-            "status": "checkout",
-            "reason": "Checkout/payment interface detected",
-            "evidence": checkout_hit,
-        }
 
     if _is_login_page(sb):
         return {
@@ -1042,7 +1684,7 @@ def _current_state(sb: SB) -> Dict[str, str]:
     if claimed_hit:
         return {
             "status": "claimed",
-            "reason": "Page reports that the daily bonus is already claimed",
+            "reason": "Visible text reports that the daily bonus is claimed",
             "evidence": claimed_hit,
         }
 
@@ -1050,55 +1692,160 @@ def _current_state(sb: SB) -> Dict[str, str]:
     if success_hit:
         return {
             "status": "success",
-            "reason": "Claim-success text detected",
+            "reason": "Visible claim-success text detected",
             "evidence": success_hit,
         }
 
-    upper = _up(text)
-    if any(marker in upper for marker in ("COIN STORE", "FREE COINS", "REWARDS", "DAILY BONUS")):
+    if _visible_checkout_detected(sb):
+        return {
+            "status": "checkout",
+            "reason": "A visible checkout/payment dialog was detected",
+            "evidence": "VISIBLE CHECKOUT DIALOG",
+        }
+
+    if _rewards_dialog_open(sb):
         return {
             "status": "rewards",
-            "reason": "Rewards/coins interface detected",
-            "evidence": "REWARDS UI",
+            "reason": "Sportzino Coin Store / rewards dialog is open",
+            "evidence": "CLAIM FREE REWARDS",
         }
 
     return {
         "status": "unknown",
-        "reason": "Page state did not match a known condition",
+        "reason": "Visible page state did not match a known condition",
         "evidence": _short(text, 120),
     }
 
 
-def _click_daily_collect(sb: SB) -> bool:
-    locators = (
-        "/html/body/div[1]/div[1]/div/div/div[2]/div[2]/div[2]/div[1]/div/div[3]/div/div[1]/button",
-        "/html/body/div[5]/div/div[1]/div/div/div[2]/div[2]/div[2]/div[1]/div/div[3]/div/div[1]/button",
-        "/html/body/div[4]/div/div[1]/div/div/div[2]/div[2]/div[2]/div[1]/div/div[3]/div/div[1]/button",
-        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'collect') and not(@disabled) and not(@aria-disabled='true')]",
-        "//button[contains(translate(normalize-space(.), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'claim') and not(@disabled) and not(@aria-disabled='true')]",
-    )
+def _wait_for_claim_result(
+    sb: SB,
+    before: Dict[str, Any],
+    timeout: float = 18,
+) -> Dict[str, str]:
+    """
+    Verify the claim using visible success text or a durable daily-card change.
 
-    return _try_click_any(sb, locators, timeout_each=4)
+    A claim is considered verified when:
+    - Sportzino shows an explicit success/claimed message; or
+    - the previously enabled Daily Bonus Collect button disappears or remains
+      disabled for multiple consecutive observations.
 
-
-def _wait_for_claim_result(sb: SB, timeout: float = 12) -> Dict[str, str]:
+    A single transient DOM change is not enough.
+    """
     step = 0.5
     loops = max(1, int(timeout / step))
-    last = _current_state(sb)
+    no_enabled_streak = 0
+    retry_used = False
+    before_enabled = int(before.get("enabledCollectCount", 0))
 
-    for _ in range(loops):
-        last = _current_state(sb)
-        print(
-            f"[Sportzino] Claim state={last['status']} "
-            f"reason={last['reason']} evidence={last['evidence']}"
+    last = {
+        "status": "unknown",
+        "reason": "No claim-result state yet",
+        "evidence": "",
+    }
+
+    for index in range(loops):
+        state = _current_state(sb)
+        observation = _daily_claim_observation(sb)
+
+        combined_visible = " ".join(
+            [
+                observation.get("dailyText", ""),
+                observation.get("visibleMessageText", ""),
+            ]
         )
 
-        if last["status"] in ("success", "claimed", "checkout", "login"):
-            return last
+        claimed_hit = _first_marker(
+            combined_visible,
+            CLAIMED_MARKERS,
+        )
+        success_hit = _first_marker(
+            combined_visible,
+            SUCCESS_MARKERS,
+        )
+
+        if claimed_hit:
+            return {
+                "status": "claimed",
+                "reason": "Sportzino confirmed the Daily Bonus is claimed",
+                "evidence": claimed_hit,
+            }
+
+        if success_hit:
+            return {
+                "status": "success",
+                "reason": "Sportzino displayed claim-success text",
+                "evidence": success_hit,
+            }
+
+        if state["status"] in ("login", "checkout"):
+            return state
+
+        enabled_now = int(
+            observation.get("enabledCollectCount", 0)
+        )
+
+        # The card had an enabled claim before the click. Require the enabled
+        # claim control to remain gone/disabled for at least two polls.
+        if before_enabled > 0 and enabled_now == 0:
+            no_enabled_streak += 1
+        else:
+            no_enabled_streak = 0
+
+        print(
+            "[Sportzino] Claim verification: "
+            f"state={state['status']} "
+            f"daily_roots={observation.get('dailyRootCount')} "
+            f"collect={observation.get('collectCount')} "
+            f"enabled_collect={enabled_now} "
+            f"gone_streak={no_enabled_streak} "
+            f"daily_text={_short(observation.get('dailyText', ''), 160)!r}"
+        )
+
+        if no_enabled_streak >= 2:
+            return {
+                "status": "success",
+                "reason": (
+                    "The enabled Progressive Daily Bonus Collect button "
+                    "disappeared or became disabled after the click"
+                ),
+                "evidence": (
+                    f"before_enabled={before_enabled} "
+                    f"after_enabled={enabled_now}"
+                ),
+            }
+
+        # If the first normal click was swallowed, retry the same high-
+        # confidence daily candidate once. Sportzino's claim endpoint should
+        # be idempotent, and no unrelated button can pass the score threshold.
+        if (
+            index == 8 and
+            not retry_used and
+            enabled_now > 0
+        ):
+            retry_used = True
+            print(
+                "[Sportzino] Daily Collect is still enabled; performing one "
+                "guarded retry."
+            )
+            _click_daily_collect(sb)
+
+        last = {
+            "status": state["status"],
+            "reason": state["reason"],
+            "evidence": state["evidence"],
+        }
 
         sb.wait(step)
 
-    return last
+    return {
+        "status": "unverified",
+        "reason": (
+            "The claim button was clicked, but Sportzino did not provide "
+            "a durable success signal"
+        ),
+        "evidence": last.get("evidence", ""),
+    }
 
 
 # ───────────────────────────────────────────────────────────
@@ -1109,24 +1856,35 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
     """
     Sportzino via SeleniumBase UC.
 
-    Important changes:
-    - Uses the exact #emailAddress and #password IDs first.
-    - Never clicks the static footer Manage Cookies link or scrolls there.
-    - Accepts or neutralizes only a real fixed/sticky cookie overlay.
-    - Waits for a confirmed redirect away from /login before looking for Rewards.
-    - Never reports "Rewards section not found" while the login form is still open.
-    - Conservatively verifies claim success after clicking Collect/Claim.
+    Discord behavior:
+    - The surrounding command/worker may send its normal launch messages.
+    - On success, send: Sportzino Daily Bonus Claimed!
+    - When unavailable, send: Sportzino Daily Bonus Unavailable.
+    - Send the final screenshot after the status message.
+    - All other claim details, scoring, and errors are printed locally.
+
+    Claim safety:
+    - Scores every visible Collect/Claim control.
+    - Requires a strong Progressive Daily Bonus / daily-bonus DOM signal.
+    - Rejects Facebook, Google, purchase, checkout, and ambiguous candidates.
+    - Verifies success using visible confirmation or a durable button change.
     """
-    del ctx, driver  # Kept in the public signature for compatibility with the bot.
+    del ctx, driver
 
     if ":" not in SPORTZINO_CRED:
-        await channel.send("[Sportzino][ERROR] Missing SPORTZINO as 'email:password' in .env")
+        print(
+            "[Sportzino][ERROR] SPORTZINO is missing from .env. "
+            "Expected email:password."
+        )
         return
 
     username, password = SPORTZINO_CRED.split(":", 1)
+    sb: Optional[SB] = None
 
     try:
         with SB(uc=True, headed=True) as sb:
+            # ── Step 1: login ──
+
             login_result = _login(sb, username, password)
             print(f"[Sportzino] Login result: {login_result}")
 
@@ -1136,32 +1894,47 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
                     channel,
                     (
                         "[Sportzino] Login did not complete — "
-                        f"{login_result['reason']}. Not attempting a claim."
+                        f"{login_result['reason']}. "
+                        "Not attempting a claim."
                     ),
                     "sportzino_login_failed",
                 )
                 return
 
-            # Normalize to the main lobby only after authentication has been
-            # positively confirmed. The existing session cookie is retained.
+            # ── Step 2: normalize to lobby and open Coin Store ──
+
             current_url = _page_snapshot(sb)["url"]
-            if not current_url or any(
-                token in current_url.lower()
-                for token in ("/auth/callback", "/connect/authorize", "/login")
+
+            if (
+                not current_url or
+                any(
+                    token in current_url.lower()
+                    for token in (
+                        "/auth/callback",
+                        "/connect/authorize",
+                        "/login",
+                    )
+                )
             ):
                 sb.open(HOME_URL)
 
-            sb.wait_for_ready_state_complete()
+            try:
+                sb.wait_for_ready_state_complete()
+            except Exception:
+                pass
+
             sb.wait(4)
             _handle_cookie_consent(sb)
             _close_popups_before_rewards(sb)
 
-            # A session-expiration redirect must be caught before rewards logic.
             if _is_login_page(sb):
                 await _send_screenshot(
                     sb,
                     channel,
-                    "[Sportzino] Login session did not persist after redirect. Not attempting a claim.",
+                    (
+                        "[Sportzino] Login session did not persist after "
+                        "the lobby redirect."
+                    ),
                     "sportzino_session_lost",
                 )
                 return
@@ -1170,27 +1943,43 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
 
             if not opened_rewards:
                 state = _current_state(sb)
-                print(f"[Sportzino] Could not open rewards. Current state: {state}")
-
-                if state["status"] == "login":
-                    caption = "[Sportzino] Login expired before Rewards could open."
-                else:
-                    caption = "[Sportzino] Rewards/Coins section not found after confirmed login."
+                print(
+                    "[Sportzino] Could not open Coin Store. "
+                    f"Current state: {state}"
+                )
 
                 await _send_screenshot(
                     sb,
                     channel,
-                    caption,
+                    (
+                        "[Sportzino] Coin Store was not found after "
+                        "confirmed login."
+                    ),
                     "sportzino_rewards_missing",
                 )
                 return
 
-            sb.wait(5)
+            sb.wait(4)
             _handle_cookie_consent(sb)
-            print("[Sportzino] Rewards UI should now be open.")
+
+            if not _rewards_dialog_open(sb):
+                print(
+                    "[Sportzino] Coin Store click occurred, but the visible "
+                    "Claim Free Rewards dialog was not confirmed."
+                )
+
+            print("[Sportzino] Coin Store / rewards interface opened.")
+
+            # ── Step 3: inspect the Progressive Daily Bonus ──
 
             pre_state = _current_state(sb)
+            before = _daily_claim_observation(sb)
+
             print(f"[Sportzino] Pre-claim state: {pre_state}")
+            print(
+                "[Sportzino] Pre-claim daily observation: "
+                f"{before}"
+            )
 
             if pre_state["status"] == "login":
                 await _send_screenshot(
@@ -1201,11 +1990,15 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
                 )
                 return
 
+            # Checkout is now based only on an actually visible payment dialog.
             if pre_state["status"] == "checkout":
                 await _send_screenshot(
                     sb,
                     channel,
-                    "[Sportzino] Checkout/payment page detected. Not marking as claimed.",
+                    (
+                        "[Sportzino] A visible checkout/payment dialog was "
+                        "detected. No claim button was clicked."
+                    ),
                     "sportzino_checkout_pre",
                 )
                 return
@@ -1214,28 +2007,46 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
                 await _send_screenshot(
                     sb,
                     channel,
-                    "[Sportzino] Bonus unavailable — today's bonus is already claimed.",
+                    "Sportzino Daily Bonus Unavailable.",
                     "sportzino_already_claimed",
+                    discord_message="Sportzino Daily Bonus Unavailable.",
                 )
                 return
 
-            clicked = _click_daily_collect(sb)
-            if not clicked:
-                state = _current_state(sb)
-                caption = (
-                    "[Sportzino] Bonus unavailable — today's bonus is already claimed."
-                    if state["status"] == "claimed"
-                    else "[Sportzino] No enabled daily Collect/Claim button was found."
+            # ── Step 4: candidate scoring and guarded click ──
+
+            clicked_candidate = _click_daily_collect(sb)
+
+            if clicked_candidate is None:
+                after_scan = _daily_claim_observation(sb)
+
+                print(
+                    "[Sportzino] No safe Progressive Daily Bonus Collect "
+                    "candidate was available."
                 )
+                print(
+                    "[Sportzino] Daily observation after failed scan: "
+                    f"{after_scan}"
+                )
+
                 await _send_screenshot(
                     sb,
                     channel,
-                    caption,
-                    "sportzino_no_claim",
+                    "Sportzino Daily Bonus Unavailable.",
+                    "sportzino_no_safe_claim",
+                    discord_message="Sportzino Daily Bonus Unavailable.",
                 )
                 return
 
-            result = _wait_for_claim_result(sb, timeout=12)
+            # ── Step 5: verify the result ──
+
+            result = _wait_for_claim_result(
+                sb,
+                before=before,
+                timeout=18,
+            )
+
+            print(f"[Sportzino] Final claim result: {result}")
 
             if result["status"] in ("success", "claimed"):
                 await _send_screenshot(
@@ -1243,15 +2054,18 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
                     channel,
                     "Sportzino Daily Bonus Claimed!",
                     "sportzino_claimed",
+                    discord_message="Sportzino Daily Bonus Claimed!",
                 )
-                print(f"[Sportzino] Claim verified: {result}")
                 return
 
             if result["status"] == "checkout":
                 await _send_screenshot(
                     sb,
                     channel,
-                    "[Sportzino] Claim click opened checkout/payment. Not marking as claimed.",
+                    (
+                        "[Sportzino] Claim interaction opened a visible "
+                        "checkout/payment dialog. Not marking as claimed."
+                    ),
                     "sportzino_checkout_false_positive",
                 )
                 return
@@ -1260,7 +2074,10 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
                 await _send_screenshot(
                     sb,
                     channel,
-                    "[Sportzino] Login expired immediately after the claim click. Not marking as claimed.",
+                    (
+                        "[Sportzino] Login expired immediately after the "
+                        "claim interaction."
+                    ),
                     "sportzino_post_click_login",
                 )
                 return
@@ -1268,10 +2085,27 @@ async def Sportzino(ctx, driver, channel: discord.abc.Messageable):
             await _send_screenshot(
                 sb,
                 channel,
-                "[Sportzino] Claim click happened, but the page did not confirm the daily claim.",
+                (
+                    "[Sportzino] The Progressive Daily Bonus button was "
+                    "clicked, but the claim could not be verified."
+                ),
                 "sportzino_unverified",
             )
 
-    except Exception as exc:
-        print(f"[Sportzino][ERROR] Exception during automation: {exc}")
-        await channel.send(f"[Sportzino][ERROR] Exception during automation: {exc}")
+    except Exception as error:
+        print(f"[Sportzino][ERROR] Exception during automation: {error}")
+
+        try:
+            if sb is not None:
+                await _send_screenshot(
+                    sb,
+                    channel,
+                    f"[Sportzino][ERROR] Automation crashed: {error}",
+                    "sportzino_error",
+                )
+        except Exception as reporting_error:
+            print(
+                "[Sportzino][ERROR] Failed while reporting crash: "
+                f"{reporting_error}"
+            )
+
