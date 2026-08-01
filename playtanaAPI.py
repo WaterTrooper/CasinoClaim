@@ -1,8 +1,8 @@
 # Drake Hooks + WaterTrooper
 # Casino Claim 3
 # Playtana API
-# Version 3.3
-# Updated 2026.05.11
+# Version 3.4
+# Updated 2026.07.30
 
 import re
 import os
@@ -14,6 +14,7 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, ElementClickInterceptedException
+
 
 # ───────────────────────────────────────────────────────────
 # Config & Constants
@@ -32,8 +33,11 @@ EMAIL_INPUT_XPATH = "//input[@data-tid='login-email-input']"
 PASSWORD_INPUT_XPATH = "//input[@data-tid='login-password-input']"
 LOGIN_SUBMIT_XPATH = "//button[@data-tid='login-btn']"
 
+POPUP_BUTTON_XPATH = "//button[@data-tid='cash-header-close-btn']"
+ADV_MAP_XPATH = "//div[@data-tid='close-modal']"
 REWARD_BUTTON_XPATH = "//button[@data-tid='promotion-card-log-in-every-day-for-guaranteed-rewards-btn']"
 CLAIM_BUTTON_XPATH = "//button[@data-tid='daily-login-action-button']"
+
 
 # ───────────────────────────────────────────────────────────
 # 0) Helpers
@@ -52,6 +56,61 @@ def _is_logged_in(driver) -> bool:
     except NoSuchElementException:
         return False
 
+
+def _wait_clickable(driver, by, value, timeout=10):
+    return WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, value)))
+
+
+def _wait_present(driver, by, value, timeout=10):
+    return WebDriverWait(driver, timeout).until(EC.presence_of_element_located((by, value)))
+
+
+def _safe_click(driver, element, label="element") -> bool:
+    try:
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block: 'center', inline: 'center'});",
+            element
+        )
+    except Exception:
+        pass
+
+    try:
+        element.click()
+        print(f"[Playtana] Clicked {label}.")
+        return True
+    except Exception as e:
+        print(f"[Playtana] Normal click failed for {label}: {e}")
+
+    try:
+        driver.execute_script("arguments[0].click();", element)
+        print(f"[Playtana] JS clicked {label}.")
+        return True
+    except Exception as e:
+        print(f"[Playtana] JS click failed for {label}: {e}")
+
+    return False
+
+
+async def _send_screenshot(channel, driver, message, filename):
+    try:
+        driver.save_screenshot(filename)
+
+        await channel.send(
+            message,
+            file=discord.File(filename)
+        )
+
+    except Exception as e:
+        print(f"[Playtana] Screenshot send failed: {e}")
+        await channel.send(message)
+
+    finally:
+        try:
+            os.remove(filename)
+        except Exception:
+            pass
+
+
 # ───────────────────────────────────────────────────────────
 # 1) Login Flow
 # ───────────────────────────────────────────────────────────
@@ -63,8 +122,8 @@ async def playtana_casino(ctx, driver, channel):
 
     username, password = PLAYTANA_CRED.split(":", 1)
 
-    print("[Playtana] Navigating to lobby...")
-    driver.get(LOBBY_URL)
+    print("[Playtana] Navigating to site...")
+    driver.get(SITE_URL)
     await asyncio.sleep(10)
 
     if _is_logged_in(driver):
@@ -75,73 +134,97 @@ async def playtana_casino(ctx, driver, channel):
     print("[Playtana] Attempting to login...")
     try:
         try:
-            login = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, LOGIN_BUTTON_XPATH)))
-            login.click()
+            login = _wait_clickable(driver, By.XPATH, LOGIN_BUTTON_XPATH, timeout=10)
+            _safe_click(driver, login, "login button")
             await asyncio.sleep(10)
-        except Exception:
-            print("[Playtana] Login button failed.")
+        except Exception as e:
+            print(f"[Playtana] Login button failed: {e}")
+
+            try:
+                print("[Playtana] Trying direct signin URL...")
+                driver.get(LOGIN_URL)
+                await asyncio.sleep(10)
+            except Exception:
+                pass
 
         try:
-            email = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, EMAIL_INPUT_XPATH)))
+            email = _wait_present(driver, By.XPATH, EMAIL_INPUT_XPATH, timeout=10)
+            email.clear()
             email.send_keys(username)
             await asyncio.sleep(5)
-        except Exception:
-            print("[Playtana] Email input failed.")
+        except Exception as e:
+            print(f"[Playtana] Email input failed: {e}")
 
         try:
-            pw = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, PASSWORD_INPUT_XPATH)))
+            pw = _wait_present(driver, By.XPATH, PASSWORD_INPUT_XPATH, timeout=10)
+            pw.clear()
             pw.send_keys(password)
             await asyncio.sleep(5)
-        except Exception:
-            print("[Playtana] Password input failed.")
+        except Exception as e:
+            print(f"[Playtana] Password input failed: {e}")
 
         try:
-            submit = WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.XPATH, LOGIN_SUBMIT_XPATH)))
-            submit.click()
+            submit = _wait_clickable(driver, By.XPATH, LOGIN_SUBMIT_XPATH, timeout=10)
+            _safe_click(driver, submit, "login submit button")
             print("[Playtana] Submitted credentials.")
             await asyncio.sleep(10)
-        except Exception:
-            print("[Playtana] Submit failed.")
+        except Exception as e:
+            print(f"[Playtana] Submit failed: {e}")
 
         await claim_playtana_bonus(ctx, driver, channel)
 
     except TimeoutException as e:
-        screenshot = "playtana_login_error.png"
-        driver.save_screenshot(screenshot)
-        await channel.send("Playtana login timed out.",file=discord.File(screenshot))
-        os.remove(screenshot)
-        print("Login timeout:", e)
+        print(f"[Playtana] Login timeout: {e}")
+
+        await _send_screenshot(
+            channel,
+            driver,
+            "Playtana login timed out.",
+            "playtana_login_error.png"
+        )
+
 
 # ───────────────────────────────────────────────────────────
 # 2) Claim Bonus
 # ───────────────────────────────────────────────────────────
 
 async def claim_playtana_bonus(ctx, driver, channel):
-    
+
     print("[Playtana] Navigating to promotions...")
     try:
         driver.get(PROMOTIONS_URL)
         await asyncio.sleep(10)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"[Playtana] Promotions navigation error: {e}")
 
-    print("[Playtana] Attempting to click claim reward button...")
+    print ("[Playtana] Attempting to close popup")
     try:
-        reward = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, REWARD_BUTTON_XPATH)))
-        reward.click()
+        popup = _wait_clickable(driver, By.XPATH, POPUP_BUTTON_XPATH, timeout=10)
+        _safe_click(driver, popup, "popup close button")
         await asyncio.sleep(10)
-    except Exception:
-        print("[Playtana] Reward failed.")
+    except Exception as e:
+        print(f"[Playtana] Popup failed: {e}")
 
-    print("[Playtant] Attempting to claim daily bonus...")
+    print ("[Playtana] Attempting to close adventure map popup")
     try:
-        claim = WebDriverWait(driver, 10).until(EC.element_to_be_clickable((By.XPATH, CLAIM_BUTTON_XPATH)))
-        # normal click
-        try:
-            claim.click()
-        except Exception:
-            # fallback JS click (very important for these sites)
-            driver.execute_script("arguments[0].click();", claim)
+        map = _wait_clickable(driver, By.XPATH, ADV_MAP_XPATH, timeout=10)
+        _safe_click(driver, map, "map close button")
+        await asyncio.sleep(10)
+    except Exception as e:
+        print(f"[Playtana] Map failed: {e}")
+
+    print ("[Playtana] Attempting to click reward button")
+    try:
+        reward = _wait_clickable(driver, By.XPATH, REWARD_BUTTON_XPATH, timeout=10)
+        _safe_click(driver, reward, "reward button")
+        await asyncio.sleep(10)
+    except Exception as e:
+        print(f"[Playtana] Reward failed: {e}")
+
+    print("[Playtana] Attempting to claim daily bonus...")
+    try:
+        claim = _wait_clickable(driver, By.XPATH, CLAIM_BUTTON_XPATH, timeout=10)
+        _safe_click(driver, claim, "claim button")
 
         await asyncio.sleep(5)
 
@@ -154,7 +237,7 @@ async def claim_playtana_bonus(ctx, driver, channel):
         os.remove(screenshot)
 
     except Exception as e:
-        print("[Playtana] Claim failed:", e)
+        print(f"[Playtana] Claim failed: {e}")
 
         # 📸 error screenshot
         screenshot = "playtana_claim_error.png"
@@ -162,4 +245,4 @@ async def claim_playtana_bonus(ctx, driver, channel):
 
         await channel.send("Playtana Daily Bonus Unavailable.",file=discord.File(screenshot))
 
-        os.remove(screenshot)        
+        os.remove(screenshot)
