@@ -220,6 +220,7 @@ api_modules = [
     "zumoAPI",
     "jollysweepsAPI",
     "sweepicoAPI",
+    "sweepsharkAPI",
     "yaycasinoAPI",
     "luckylandAPI",
 
@@ -1237,6 +1238,10 @@ async def _run_sweepico(channel):
     await sweepico_casino(None, driver, channel)
 
 
+async def _run_sweepshark(channel):
+    await sweepshark_casino(None, driver, channel)
+
+
 async def _run_lonestar(channel):
     await lonestar_casino(None, driver, channel)
 
@@ -1320,6 +1325,7 @@ casino_loop_entries: List[CasinoLoopEntry] = [
     CasinoLoopEntry("funrize", "Funrize", _run_funrize, 1440),
 
     CasinoLoopEntry("sweepico", "Sweepico", _run_sweepico, 1440),
+    CasinoLoopEntry("sweepico", "Sweepshark", _run_sweepshark, 1440),
 
     CasinoLoopEntry("sweepjungle", "SweepJungle", _run_sweepjungle, 1440),
     CasinoLoopEntry("zumo", "Zumo", _run_zumo, 1440),
@@ -2075,6 +2081,7 @@ MANUAL_CASINO_COMMANDS = {
     "zumo",
     "jollysweeps",
     "sweepico",
+    "sweepshark",
     "luckparty",
     "luckyparty",
     "winbonanza",
@@ -3186,6 +3193,16 @@ async def sweepico_cmd(ctx):
     )
 
 
+@bot.command(name="sweepshark")
+async def sweepshark_cmd(ctx):
+    await ctx.send("Checking Sweepshark for bonus...")
+    await _run_manual_casino_command(
+        ctx,
+        "Sweepshark",
+        lambda pctx, channel: sweepshark_casino(pctx, driver, channel),
+    )
+
+
 @bot.command(name="chipnwin")
 async def chipnwin_cmd(ctx):
     await ctx.send("Checking Chipnwin for bonus...")
@@ -3392,6 +3409,7 @@ async def _debug_worker_flow(ctx, channel, key: str):
         "zumo": lambda: zumo_casino(ctx, driver, channel),
         "jollysweeps": lambda: jollysweeps_casino(ctx, driver, channel),
         "sweepico": lambda: sweepico_casino(ctx, driver, channel),
+        "sweepshark": lambda: sweepshark_casino(ctx, driver, channel),
         "crowncoins": lambda: crowncoins_casino(driver, _bot(), ctx, channel),
         "americanluck": lambda: americanluck_uc(ctx, channel),
         "rollingriches": lambda: rolling_riches_casino(ctx, driver, channel),
@@ -3656,7 +3674,7 @@ async def help_cmd(ctx):
 !smilescasino, !yaycasino, !realprize, !luckyland, !jumbo, !spree,
 !chipnwin, !wildworld, !lonestar, !gains, !luckparty, !winbonanza,
 !stormrush, !scarletsands, !playtana, !cashoomo, !taofortune,
-!sweepjungle, !zumo, !jollysweeps, !sweepico,
+!sweepjungle, !zumo, !jollysweeps, !sweepico, !sweepshark,
 
 Aliases:
 !luckyparty, !lp
