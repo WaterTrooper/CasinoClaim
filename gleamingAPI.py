@@ -2,7 +2,7 @@
 # Casino Claim 3
 # Gleaming API
 # Version 3.4
-# Updated 2026.09.06
+# Updated 2026.10.31
 
 import re
 import os
@@ -34,7 +34,7 @@ PASSWORD_INPUT_XPATH = "//input[@data-testid='login-password-input']"
 LOGIN_SUBMIT_XPATH = "//button[@data-testid='login-submit-button']"
 
 REWARD_BUTTON_XPATH = "//img[@alt='daily_bonus']"
-CLAIM_BUTTON_XPATH = "//button[contains(@class, 'inline-flex shrink-0 items-center') and not(@disabled)]//span[text()='CLAIM YOUR BONUS!']"
+CLAIM_BUTTON_XPATH = "//button[contains(@class, 'inline-flex items-center justify-center') and not(@disabled)]//span[text()='CLAIM YOUR BONUS!']"
 
 
 # ───────────────────────────────────────────────────────────
