@@ -2,7 +2,7 @@
 # Casino Claim 3
 # SweepJungle API
 # Version 3.4
-# Updated 2026.11.20
+# Updated 2026.11.21
 
 import re
 import os
@@ -33,9 +33,10 @@ LOGIN_SUBMIT_XPATH = "//button[contains(@class, 'bg-yellow-300 text-neutral-0 bo
 
 BEST_DEAL_XPATH = "//button[@class='flex size-9 cursor-pointer items-center justify-center rounded-full bg-transparent ease-spring transition-transform duration-100 hover:scale-110 hover:bg-transparent absolute top-6 right-3 z-30']"
 WILD_SHOP_XPATH = "//button[@class='flex cursor-pointer items-center justify-center bg-transparent ease-spring duration-100 hover:scale-110 hover:bg-transparent absolute right-0 size-6 rounded-full transition-transform']"
+BONUS_MODAL_XPATH = "//button[@class='flex size-9 cursor-pointer items-center justify-center rounded-full bg-transparent ease-spring transition-transform duration-100 hover:scale-110 hover:bg-transparent absolute top-2 right-1']"
 GRAND_PRIZE_XPATH = "//button[@class='flex size-9 cursor-pointer items-center justify-center rounded-full bg-transparent ease-spring transition-transform duration-100 hover:scale-110 hover:bg-transparent absolute -top-1 right-1']"
 POWER_TOTEM_XPATH = "//button[@class='flex size-9 cursor-pointer items-center justify-center rounded-full bg-transparent ease-spring transition-transform duration-100 hover:scale-110 hover:bg-transparent absolute top-[-40px] right-[-12px]']"
-REWARD_BUTTON_XPATH = "//img[@alt='daily-refill-widget']"
+REWARD_BUTTON_XPATH = "//button[@aria-label='daily refill']"
 CLAIM_BUTTON_XPATH = "//button[contains(@class, '!text-h5 cursor-pointer w-full py-3 flex items-center')]//span[text()='Claim']"
 
 
@@ -205,6 +206,14 @@ async def claim_sweepjungle_bonus(ctx, driver, channel):
         await asyncio.sleep(10)
     except Exception as e:
         print(f"[SweepJungle] Wild shop failed: {e}")
+
+    print("[SweepJungle] Attemping to close bonus modal...")
+    try:
+        bonus = _wait_clickable(driver, By.XPATH, BONUS_MODAL_XPATH, timeout=10)
+        _safe_click(driver, bonus, "bonus close button")
+        await asyncio.sleep(10)
+    except Exception as e:
+        print(f"[SweepJungle] Bonus failed: {e}")
 
     print("[SweepJungle] Attemping to close grand prize modal...")
     try:
