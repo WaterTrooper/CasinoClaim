@@ -207,6 +207,7 @@ api_modules = [
     "smilescasinoAPI",
     "jumboAPI",
     "spreeAPI",
+    "bighitAPI",
     "chipnwinAPI",
     "wildworldAPI",
     "lonestarAPI",
@@ -1192,6 +1193,10 @@ async def _run_spree(channel):
     await spree_uc(None, channel)
 
 
+async def _run_bighit(channel):
+    await bighit_uc(None, channel)
+
+
 async def _run_chipnwin(channel):
     await chipnwin_casino(None, driver, channel)
 
@@ -1343,6 +1348,8 @@ casino_loop_entries: List[CasinoLoopEntry] = [
     CasinoLoopEntry("jollysweeps", "Jolly Sweeps", _run_jollysweeps, 1440),
 
     CasinoLoopEntry("gleaming", "Gleaming", _run_gleaming, 1440),
+
+    CasinoLoopEntry("bighit", "BigHit", _run_bighit, 1440),
 
     CasinoLoopEntry("rollingriches", "Rolling Riches", _run_rollingriches, 1440),
     CasinoLoopEntry("americanluck", "American Luck", _run_americanluck, 1440),
@@ -2080,6 +2087,7 @@ MANUAL_CASINO_COMMANDS = {
     "realprize",
     "jumbo",
     "spree",
+    "bighit",
     "chipnwin",
     "wildworld",
     "lonestar",
@@ -3087,6 +3095,16 @@ async def spree_cmd(ctx):
     )
 
 
+@bot.command(name="bighit")
+async def bighit_cmd(ctx):
+    await ctx.send("Checking BigHit for bonus...")
+    await _run_manual_casino_command(
+        ctx,
+        "BigHit",
+        lambda pctx, channel: bighit_uc(pctx, channel),
+    )
+
+
 @bot.command(name="wildworld")
 async def wildworld_cmd(ctx):
     await ctx.send("Checking Wild World Casino for bonus...")
@@ -3429,6 +3447,7 @@ async def _debug_worker_flow(ctx, channel, key: str):
         "smilescasino": lambda: smilescasino_casino(ctx, driver, channel),
         "jumbo": lambda: jumbo_casino(ctx, driver, channel),
         "spree": lambda: spree_uc(ctx, channel),
+        "bighit": lambda: bighit_uc(ctx, channel),
         "chipnwin": lambda: chipnwin_casino(ctx, driver, channel),
         "wildworld": lambda: wildworld_casino(ctx, driver, channel),
         "lonestar": lambda: lonestar_casino(ctx, driver, channel),
@@ -3710,7 +3729,7 @@ async def help_cmd(ctx):
 !chipnwin, !wildworld, !lonestar, !gains, !luckparty, !winbonanza,
 !stormrush, !scarletsands, !playtana, !cashoomo, !taofortune,
 !sweepjungle, !zumo, !jollysweeps, !sweepico, !sweepshark, !gleaming,
-!vegasway,
+!vegasway, !bighit,
 
 Aliases:
 !luckyparty, !lp
