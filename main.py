@@ -221,6 +221,7 @@ api_modules = [
     "zumoAPI",
     "jollysweepsAPI",
     "gleamingAPI",
+    "rollzaAPI",
     "vegaswayAPI",
     "sweepicoAPI",
     "sweepsharkAPI",
@@ -1244,6 +1245,11 @@ async def _run_jollysweeps(channel):
 async def _run_gleaming(channel):
     await gleaming_casino(None, driver, channel)
 
+
+async def _run_rollza(channel):
+    await rollza_casino(None, driver, channel)
+
+
 async def _run_vegasway(channel):
     await vegasway_casino(None, driver, channel)
 
@@ -1348,6 +1354,8 @@ casino_loop_entries: List[CasinoLoopEntry] = [
     CasinoLoopEntry("jollysweeps", "Jolly Sweeps", _run_jollysweeps, 1440),
 
     CasinoLoopEntry("gleaming", "Gleaming", _run_gleaming, 1440),
+
+    CasinoLoopEntry("rollza", "Rollza", _run_rollza, 1440),
 
     CasinoLoopEntry("bighit", "BigHit", _run_bighit, 1440),
 
@@ -2101,6 +2109,7 @@ MANUAL_CASINO_COMMANDS = {
     "zumo",
     "jollysweeps",
     "gleaming",
+    "rollza",
     "vegasway",
     "sweepico",
     "sweepshark",
@@ -3224,6 +3233,17 @@ async def gleaming_cmd(ctx):
         lambda pctx, channel: gleaming_casino(pctx, driver, channel),
     )
 
+
+@bot.command(name="rollza")
+async def rollza_cmd(ctx):
+    await ctx.send("Checking Rollza for bonus...")
+    await _run_manual_casino_command(
+        ctx,
+        "Rollza",
+        lambda pctx, channel: rollza_casino(pctx, driver, channel),
+    )
+
+
 @bot.command(name="vegasway")
 async def vegasway_cmd(ctx):
     await ctx.send("Checking VegasWay for bonus...")
@@ -3461,6 +3481,7 @@ async def _debug_worker_flow(ctx, channel, key: str):
         "zumo": lambda: zumo_casino(ctx, driver, channel),
         "jollysweeps": lambda: jollysweeps_casino(ctx, driver, channel),
         "gleaming": lambda: gleaming_casino(ctx, driver, channel),
+        "rollza": lambda: rollza_casino(ctx, driver, channel),
         "vegasway": lambda: vegasway_casino(ctx, driver, channel),
         "sweepico": lambda: sweepico_casino(ctx, driver, channel),
         "sweepshark": lambda: sweepshark_casino(ctx, driver, channel),
@@ -3729,7 +3750,7 @@ async def help_cmd(ctx):
 !chipnwin, !wildworld, !lonestar, !gains, !luckparty, !winbonanza,
 !stormrush, !scarletsands, !playtana, !cashoomo, !taofortune,
 !sweepjungle, !zumo, !jollysweeps, !sweepico, !sweepshark, !gleaming,
-!vegasway, !bighit,
+!vegasway, !bighit, !rollza,
 
 Aliases:
 !luckyparty, !lp
